@@ -1,0 +1,6 @@
+# Arduino ignore
+*.hex
+*.elf
+*.bin
+build/
+.DS_Store
