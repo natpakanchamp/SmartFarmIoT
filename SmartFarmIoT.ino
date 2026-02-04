@@ -48,6 +48,8 @@ bool isValveMainOn = false;
 bool isMorningDone = false;
 bool isEveningDone = false;
 
+bool isManualMode = false;
+
 // --------------------- WiFi Setting --------------------------------
 const char* ssid_1 = "@JumboPlusIoT";
 const char* pass_1 = "rebplhzu";
@@ -68,6 +70,37 @@ const char* topic_status = "group8/status";
 const char* topic_dli = "group8/dli";
 const char* topic_soil = "group8/soil";
 const char* topic_valve = "group8/valve/main";
+
+// --------------------- Callback Function ------------------------------
+void callback(char* topic, byte* payload, unsigned int length){
+  Serial.print("Message [");
+  Serial.print(topic);
+  Serial.print("]");
+
+  String msg = "";
+  for (int i = 0; i < length; i++){
+    msg += (char)payload[i];
+  }
+  Serial.print(msg);
+
+  // สั่งงานผ่านมือถือ (Topic: group8/command)
+  if(String(topic) == mqtt_topic_cmd){
+    if(msg == "ON"){
+      isManualMode = true;
+      digitalWrite(RELAY_VALVE_MAIN, LOW);
+      isValveMainOn = true;
+      Serial.println("MANUAL: VALVE ON");
+    }else if(msg == "OFF"){
+      isManualMode = true;
+      digitalWrite(RELAY_VALVE_MAIN, HIGH);
+      isValveMainOn = false;
+      Serial.println("MANUAL: VALVE OFF");
+    }else if(msg == "AUTO"){
+      isManualMode = false;
+      Serial.println("SYSTEM: AUTO MODE");
+    }
+  }
+}
 
 // --------------------- Tick Status -----------------------------------------
 void tick(){
@@ -112,6 +145,7 @@ void connect(){
   
   // MQTT
   client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(callback);
   Serial.print("Connecting MQTT...");
 
   while(!client.connected()){
@@ -164,38 +198,42 @@ void calculate(int currentHour){
     current_DLI = 0; 
   }
 
-  // WATER SYSTEM
-  bool isMorning = (currentHour >= MORNING_START && currentHour < MORNING_END);
-  bool isEvening = (currentHour >= EVENING_START && currentHour < EVENING_END);
-  // ถ้าไม่ได้อยู่ในช่วงเช้าและเย็น
-  if(!isMorning && !isEvening){
-    digitalWrite(RELAY_VALVE_MAIN, HIGH);
-    isValveMainOn = false;
-    isMorningDone = false;
-    isEveningDone = false;
-  }
-  // ถ้าอยู่ในช่วงเช้าและเย็น
-  else{
-    bool *currentDoneFlag = isMorning ? &isMorningDone : &isEveningDone;
-    // เช็คว่าจบการทำงานหรือยัง และแดดปลอดภัยมั้ย
-    if(!(*currentDoneFlag) && lux < LUX_SAFE_LIMIT){
-      // ถ้าดินชุ่มถึงเป้าหมายแล้ว (80%) -> จบงานทันที
-      if (soilPercent >= SOIL_MAX) {
-        digitalWrite(RELAY_VALVE_MAIN, HIGH); // ปิดวาล์ว
-        isValveMainOn = false;
-        *currentDoneFlag = true; // ระบบจะไม่รดน้ำอีกต่อไปจนกว่าจะเปลี่ยนรอบ
-      }
-      // ถ้าดินแห้งต่ำว่า 40% -> เติมน้ำ
-      else if(soilPercent <= SOIL_MIN){
-        digitalWrite(RELAY_VALVE_MAIN, HIGH);
-        isValveMainOn = true;
-      }
-      // ระบบนี้จะทำงานอยู่ในช่วง 41% - 79%
-    }
-    // รดน้ำเสร็จแล้ว หรือแดดแรงเกิน -> ปิดวาล์ว
-    else{
+  if(isManualMode){
+    // Do something
+  }else{
+    // WATER SYSTEM
+    bool isMorning = (currentHour >= MORNING_START && currentHour < MORNING_END);
+    bool isEvening = (currentHour >= EVENING_START && currentHour < EVENING_END);
+    // ถ้าไม่ได้อยู่ในช่วงเช้าและเย็น
+    if(!isMorning && !isEvening){
       digitalWrite(RELAY_VALVE_MAIN, HIGH);
       isValveMainOn = false;
+      isMorningDone = false;
+      isEveningDone = false;
+    }
+    // ถ้าอยู่ในช่วงเช้าและเย็น
+    else{
+      bool *currentDoneFlag = isMorning ? &isMorningDone : &isEveningDone;
+      // เช็คว่าจบการทำงานหรือยัง และแดดปลอดภัยมั้ย
+      if(!(*currentDoneFlag) && lux < LUX_SAFE_LIMIT){
+        // ถ้าดินชุ่มถึงเป้าหมายแล้ว (80%) -> จบงานทันที
+        if (soilPercent >= SOIL_MAX) {
+          digitalWrite(RELAY_VALVE_MAIN, HIGH); // ปิดวาล์ว
+          isValveMainOn = false;
+          *currentDoneFlag = true; // ระบบจะไม่รดน้ำอีกต่อไปจนกว่าจะเปลี่ยนรอบ
+        }
+        // ถ้าดินแห้งต่ำว่า 40% -> เติมน้ำ
+        else if(soilPercent <= SOIL_MIN){
+          digitalWrite(RELAY_VALVE_MAIN, HIGH);
+          isValveMainOn = true;
+        }
+        // ระบบนี้จะทำงานอยู่ในช่วง 41% - 79%
+      }
+      // รดน้ำเสร็จแล้ว หรือแดดแรงเกิน -> ปิดวาล์ว
+      else{
+        digitalWrite(RELAY_VALVE_MAIN, HIGH);
+        isValveMainOn = false;
+      }
     }
   }
 
@@ -218,6 +256,7 @@ void calculate(int currentHour){
   // ส่งค่า SOIL (ค่าความชื้น)
   sprintf(msg, "%d", soilPercent);
   client.publish(topic_soil, msg);
+  client.publish(topic_status, isManualMode ? "MANUAL" : "AUTO");
 }
 
 void setup() {
