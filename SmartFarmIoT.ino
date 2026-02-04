@@ -227,6 +227,9 @@ void setup() {
 
   pinMode(RELAY_LIGHT, OUTPUT);  
   digitalWrite(RELAY_LIGHT, HIGH); 
+
+  pinMode(RELAY_VALVE_MAIN, OUTPUT);
+  digitalWrite(RELAY_VALVE_MAIN, HIGH);
     
   pinMode(SOIL_PIN, INPUT);
   
