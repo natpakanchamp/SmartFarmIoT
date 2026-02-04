@@ -48,7 +48,9 @@ bool isValveMainOn = false;
 bool isMorningDone = false;
 bool isEveningDone = false;
 
-bool isManualMode = false;
+// [Manual Modes] แยกกันอิสระ
+bool isValveManual = false; 
+bool isLightManual = false;
 
 // --------------------- WiFi Setting --------------------------------
 const char* ssid_1 = "@JumboPlusIoT";
@@ -85,19 +87,58 @@ void callback(char* topic, byte* payload, unsigned int length){
 
   // สั่งงานผ่านมือถือ (Topic: group8/command)
   if(String(topic) == mqtt_topic_cmd){
-    if(msg == "ON"){
-      isManualMode = true;
-      digitalWrite(RELAY_VALVE_MAIN, LOW);
-      isValveMainOn = true;
-      Serial.println("MANUAL: VALVE ON");
-    }else if(msg == "OFF"){
-      isManualMode = true;
-      digitalWrite(RELAY_VALVE_MAIN, HIGH);
-      isValveMainOn = false;
-      Serial.println("MANUAL: VALVE OFF");
-    }else if(msg == "AUTO"){
-      isManualMode = false;
-      Serial.println("SYSTEM: AUTO MODE");
+  // ควบคุมน้ำเอง
+    if(msg == "VALVE_MANUAL"){
+      isValveManual = true;
+      Serial.println("SET MODE: VALVE MANUAL");
+    }else if(msg == "VALVE_AUTO"){
+      isValveManual = false;
+      Serial.println("SET MODE: VALVE AUTO");
+    }
+    // Action Control ทำงานตอนอยู๋ในโหมด Manual เท่านั้น
+    else if(msg == "VALVE_ON"){
+      if(isValveManual){
+        digitalWrite(RELAY_VALVE_MAIN, LOW);
+        isValveMainOn = true;
+        Serial.println("MANUAL: VALVE ON"); 
+      }else{
+        Serial.println("System is in AUTO Mode!!");
+      }
+    }else if(msg == "VALVE_OFF"){
+      if(isValveManual){
+        digitalWrite(RELAY_VALVE_MAIN, HIGH);
+        isValveMainOn = false;
+        Serial.println("MANUAL: VALVE OFF");
+      }else{
+        Serial.println("System is in AUTO Mode!!");
+      }
+    }
+  // ควบคุมไฟเอง
+    else if(msg == "LIGHT_MANUAL"){
+      isLightManual = true;
+      Serial.println("SET MODE: LIGHT MANUAL");
+    }else if(msg == "LIGHT_AUTO"){
+      isLightManual = false;
+      Serial.println("SET MODE: LIGHT AUTO");
+    }
+    // Action Control ทำงานได้เฉพาะอยู่ในโหมด manual เท่านั้น
+    else if(msg == "LIGHT_ON"){
+      if(isLightManual){
+        digitalWrite(RELAY_LIGHT, LOW);
+        isLightOn = true;
+        Serial.println("MANUAL: LIGHT ON");
+      }else{
+        Serial.println("System is in AUTO Mode!!");
+      }
+      
+    }else if(msg == "LIGHT_OFF"){
+      if(isLightManual){
+        digitalWrite(RELAY_LIGHT, HIGH);
+        isLightOn = false;
+        Serial.println("MANUAL: LIGHT OFF");
+      }else{
+        Serial.println("System is in AUTO Mode!!");
+      }
     }
   }
 }
@@ -185,21 +226,29 @@ void calculate(int currentHour){
   soilPercent = map(rawSoil, AIR_VALUE, WATER_VALUE, 0, 100);
   soilPercent = constrain(soilPercent, 0, 100); // 0 - 100 %
 
-  if(currentHour >= 6 && currentHour < 18){
-    digitalWrite(RELAY_LIGHT,HIGH);
-  }else if(currentHour >= 18 && currentHour < 24){
-    if(current_DLI < target_DLI){
-      digitalWrite(RELAY_LIGHT, LOW); // เปิดไฟ
+  if(isLightManual){
+    isLightOn = (digitalRead(RELAY_LIGHT) == LOW);
+  }
+  else {
+    if(currentHour >= 6 && currentHour < 18){
+      digitalWrite(RELAY_LIGHT,HIGH);
+    }else if(currentHour >= 18 && currentHour < 24){
+      if(current_DLI < target_DLI){
+        digitalWrite(RELAY_LIGHT, LOW); // เปิดไฟ
+      }else{
+        digitalWrite(RELAY_LIGHT, HIGH); 
+      }
     }else{
-      digitalWrite(RELAY_LIGHT, HIGH); 
+      digitalWrite(RELAY_LIGHT, HIGH);
+    }
+    // ถ้าเป็นตอนเที่ยงคืนให้ Reset ค่า DLI
+    if(currentHour == 0 && current_DLI > 1.0){ // >1.0 เพื่อกัน Reset รัวๆ
+      current_DLI = 0; 
     }
   }
-  if(currentHour == 0 && current_DLI > 1.0){ // >1.0 เพื่อกัน Reset รัวๆ
-    current_DLI = 0; 
-  }
 
-  if(isManualMode){
-    // Do something
+  if(isValveManual){
+    isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
   }else{
     // WATER SYSTEM
     bool isMorning = (currentHour >= MORNING_START && currentHour < MORNING_END);
@@ -224,7 +273,7 @@ void calculate(int currentHour){
         }
         // ถ้าดินแห้งต่ำว่า 40% -> เติมน้ำ
         else if(soilPercent <= SOIL_MIN){
-          digitalWrite(RELAY_VALVE_MAIN, HIGH);
+          digitalWrite(RELAY_VALVE_MAIN, LOW);
           isValveMainOn = true;
         }
         // ระบบนี้จะทำงานอยู่ในช่วง 41% - 79%
@@ -238,6 +287,7 @@ void calculate(int currentHour){
   }
 
   // Debug Monitor
+  Serial.print("--- Status ---");
   Serial.print(" | Lux: "); Serial.print(lux);
   Serial.print(" | DLI: "); Serial.println(current_DLI);
 
@@ -256,7 +306,9 @@ void calculate(int currentHour){
   // ส่งค่า SOIL (ค่าความชื้น)
   sprintf(msg, "%d", soilPercent);
   client.publish(topic_soil, msg);
-  client.publish(topic_status, isManualMode ? "MANUAL" : "AUTO");
+
+  String statusMsg = "V:" + String(isValveManual ? "MANUAL" : "AUTO") + " | L:" + String(isLightManual ? "MANUAL" : "AUTO");
+  client.publish(topic_status, statusMsg.c_str());
 }
 
 void setup() {
