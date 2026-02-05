@@ -7,6 +7,9 @@
 #include <Ticker.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
 
 #define RELAY_LIGHT 4 // แก้ขา Pin ตามที่ใช้งานจริง
 #define SOIL_PIN 34  // ขาอ่านค่าความชื้นดิน (ADC1 Only)
@@ -149,8 +152,12 @@ void updateDisplay_Dynamic(int h, int m){
   tft.setTextColor(TFT_YELLOW, TFT_BLACK); // สีเหลือง พื้นดำ (กันกระพริบ)
   tft.setTextDatum(TR_DATUM);
 
+  int paddingWidth = tft.textWidth("888");
+  tft.setTextPadding(paddingWidth);
+
   tft.drawNumber(soilPercent, 200, 10); // แสดงค่า Soil ที่พิกัด x=200
   tft.drawFloat(current_DLI, 2, 200, 40); // แสดงค่า Lux/DLI
+  tft.setTextPadding(0); // ยกเลิก Padding เมื่อใช้เสร็จ เพื่อกันไปกระทบส่วนอื่น
 
   // --- 2. อัปเดตสถานะ VALVE (วงกลมสี) ---
   // โหมด Auto/Manual
@@ -309,7 +316,12 @@ void connect(){
       return;
     }
 
-    if(client.connect(mqtt_client_id)){
+    // ถ้าหลุด ลองต่อใหม่ (Silent Reconnect)
+    Serial.print("Attempting Silent MQTT connection...");
+
+    String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+
+    if(client.connect(clientId.c_str())){
       Serial.println("\nMQTT Reconnected (Silent)!");
       client.subscribe(mqtt_topic_cmd);
       client.publish(topic_status, "SYSTEM READY");
@@ -317,8 +329,11 @@ void connect(){
       if(!isSceneShown) drawScene_Main();
       return;
     }else{
-      Serial.println("MQTT Failed... Retrying silently");
-      delay(1000); 
+      // [FIXED] ต้องปริ้น Error Code (client.state) ออกมาดู!
+      Serial.print(" -> Failed! rc=");
+      Serial.print(client.state());
+      Serial.println(" (Check error code)");
+      delay(2000); 
       return;
     }
   }
@@ -346,13 +361,16 @@ void connect(){
   Serial.print("Connecting MQTT...");
 
   while(!client.connected()){
-    if(client.connect(mqtt_client_id)){
+    String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+    if(client.connect(clientId.c_str())){
       Serial.println("\nMQTT Connected!");
       client.subscribe(mqtt_topic_cmd);
       client.publish(topic_status, "SYSTEM READY");
     } else {
-      Serial.print(".");
-      delay(1000);
+      Serial.print("failed, rc=");
+      Serial.print(client.state()); // ปริ้น Error Code
+      Serial.println(" try again in 2 seconds");
+      delay(2000);
     }
   }
   blinker.detach();
@@ -470,7 +488,7 @@ void calculate(int currentHour){
   String statusMsg = "V:" + String(isValveManual ? "MANUAL" : "AUTO") + " | L:" + String(isLightManual ? "MANUAL" : "AUTO");
   client.publish(topic_status, statusMsg.c_str());
 
-  sprintf(msg, ".2f", lux);
+  sprintf(msg, "%.2f", lux);
   client.publish(topic_lux, msg);
 }
 
@@ -499,7 +517,7 @@ void setup() {
   delay(1000);
 
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)){
-    Serial.print(F("BH1750 Ready!"));
+    Serial.println(F("BH1750 Ready!"));
   } else {
     Serial.print(F("Error initialising BH1750!!"));
   }
