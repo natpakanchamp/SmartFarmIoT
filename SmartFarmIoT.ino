@@ -81,6 +81,7 @@ const char* topic_status = "group8/status";
 const char* topic_dli = "group8/dli";
 const char* topic_soil = "group8/soil";
 const char* topic_valve = "group8/valve/main";
+const char* topic_lux = "group8/lux";
 
 unsigned long lastScreenUpdate = 0;
 
@@ -377,7 +378,7 @@ void calculate(int currentHour){
   float ppfd = lux * factor_used;
   current_DLI += (ppfd * 1.0) / 1000000.0;
   Serial.print("Current DLI: ");
-  Serial.print(current_DLI);
+  Serial.println(current_DLI);
 
   // อ่านค่าความชื้นดิน
   int rawSoil = analogRead(SOIL_PIN);
@@ -445,15 +446,16 @@ void calculate(int currentHour){
   }
 
   // Debug Monitor
-  Serial.print("--- Status ---");
-  Serial.print(" | Lux: "); Serial.print(lux);
+  Serial.println("--- Status ---");
+  Serial.print(" | Lux: "); Serial.println(lux);
   Serial.print(" | DLI: "); Serial.println(current_DLI);
 
-  Serial.println("Hr: "); Serial.print(currentHour);
-  Serial.println(" | Soil: "); Serial.print(soilPercent);
-  Serial.println("% | Valve: "); Serial.print(isValveMainOn ? "ON" : "OFF");
-  Serial.println(" | M-Done: "); Serial.print(isMorningDone);
-  Serial.println(" | E-Done: "); Serial.println(isEveningDone);
+  Serial.print("Current Hour: "); Serial.println(currentHour);
+  Serial.print(" | Soil: "); Serial.println(soilPercent);
+  Serial.print(" | Light: "); Serial.println(isLightOn);
+  Serial.print(" | Valve: "); Serial.println(isValveMainOn ? "ON" : "OFF");
+  Serial.print(" | M-Done: "); Serial.println(isMorningDone);
+  Serial.print(" | E-Done: "); Serial.println(isEveningDone);
 
 
 
@@ -467,6 +469,9 @@ void calculate(int currentHour){
 
   String statusMsg = "V:" + String(isValveManual ? "MANUAL" : "AUTO") + " | L:" + String(isLightManual ? "MANUAL" : "AUTO");
   client.publish(topic_status, statusMsg.c_str());
+
+  sprintf(msg, ".2f", lux);
+  client.publish(topic_lux, msg);
 }
 
 void setup() {
@@ -513,19 +518,26 @@ void loop() {
   if(millis() - lastScreenUpdate > 1000){
     lastScreenUpdate = millis();
 
+    int currentHour = 0;
+    int currentMin = 0;
+    bool timeValid = false;
+
     struct tm timeinfo;
     if(getLocalTime(&timeinfo)){
+      currentHour = timeinfo.tm_hour;
+      currentMin = timeinfo.tm_min;
+      timeValid = true;
       Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-      int currentHour = timeinfo.tm_hour;
-      int currentMin = timeinfo.tm_min;
+      
 
       // เรียกฟังก์ชันคำนวณ (ไม่งั้น DLI ไม่ขยับ)
       calculate(currentHour);
-      updateDisplay_Dynamic(currentHour, currentMin);
+      
+    }else{
+      Serial.println("Time Sync Failed: Offline");
+      currentHour = 12;
+      timeValid = false;
     }
-    if(!getLocalTime(&timeinfo)){
-      Serial.println("Failed to show time");
-      return;
-    }
+    updateDisplay_Dynamic(currentHour, currentMin);
   }
 }
