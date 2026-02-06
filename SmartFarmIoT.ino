@@ -62,6 +62,11 @@ bool isLightManual = false;
 
 bool isSceneShown = false;
 
+unsigned long lastNetworkCheck = 0; // สำหรับเช็คเน็ตโดยไม่บล๊อกการทำงานหลัก
+unsigned long lastCalcUpdate = 0; // สำหรับคำนวณ DLI และรดน้ำ
+
+bool isTimeSynced = false;
+
 
 
 // --------------------- WiFi Setting --------------------------------
@@ -90,13 +95,14 @@ unsigned long lastScreenUpdate = 0;
 
 // ----------------------- Relay Control Function -----------------
 void setRelayState(int pin, bool active){
+  pinMode(pin, OUTPUT);
   if(active){
     // Active LOW สั่งเปิด
-    pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }else{
     // Active HIGH สั่งปิด
-    digitalWrite(pin, INPUT);
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH);
   }
 }
 
@@ -298,89 +304,122 @@ void timezoneSync(){
   Serial.println("Waiting for time syncing...");
 
   struct tm timeinfo;
-  while(!getLocalTime(&timeinfo)){
+  int retry = 0;
+  while(!getLocalTime(&timeinfo) && retry < 10){ // ให้ลองเชื่อมเน็ตทั้งหมด 10 ครั้ง
     Serial.println(".");
     delay(500); 
+    retry++;
   }
-  Serial.println("\nTime Synced!");
+
+  if(retry < 10){
+    Serial.println("\nTime Synced!");
+    isTimeSynced = true;
+  }else{
+    Serial.println("\n")
+  }
+  
 }
 
 
-// --------------------- Connection ---------------------------------
-void connect(){
-  if(wifiMulti.run() == WL_CONNECTED){
-    client.setServer(mqtt_broker, mqtt_port);
-    client.setCallback(callback);
+// // --------------------- Connection ---------------------------------
+// void connect(){
+//   if(wifiMulti.run() == WL_CONNECTED){
+//     client.setServer(mqtt_broker, mqtt_port);
+//     client.setCallback(callback);
 
-    if(client.connected()){
-      return;
-    }
+//     if(client.connected()){
+//       return;
+//     }
 
-    // ถ้าหลุด ลองต่อใหม่ (Silent Reconnect)
-    Serial.print("Attempting Silent MQTT connection...");
+//     // ถ้าหลุด ลองต่อใหม่ (Silent Reconnect)
+//     Serial.print("Attempting Silent MQTT connection...");
 
-    String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+//     String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
 
-    if(client.connect(clientId.c_str())){
-      Serial.println("\nMQTT Reconnected (Silent)!");
-      client.subscribe(mqtt_topic_cmd);
-      client.publish(topic_status, "SYSTEM READY");
+//     if(client.connect(clientId.c_str())){
+//       Serial.println("\nMQTT Reconnected (Silent)!");
+//       client.subscribe(mqtt_topic_cmd);
+//       client.publish(topic_status, "SYSTEM READY");
 
-      if(!isSceneShown) drawScene_Main();
-      return;
-    }else{
-      // [FIXED] ต้องปริ้น Error Code (client.state) ออกมาดู!
-      Serial.print(" -> Failed! rc=");
-      Serial.print(client.state());
-      Serial.println(" (Check error code)");
-      delay(2000); 
-      return;
-    }
-  }
-  // ระหว่างรอ WiFi ให้ขึ้นจอหน่อย
-  isSceneShown = false;
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.drawString("Connecting...", 120, 120, 4);
+//       if(!isSceneShown) drawScene_Main();
+//       return;
+//     }else{
+//       // [FIXED] ต้องปริ้น Error Code (client.state) ออกมาดู!
+//       Serial.print(" -> Failed! rc=");
+//       Serial.print(client.state());
+//       Serial.println(" (Check error code)");
+//       delay(2000); 
+//       return;
+//     }
+//   }
+//   // ระหว่างรอ WiFi ให้ขึ้นจอหน่อย
+//   isSceneShown = false;
+//   tft.fillScreen(TFT_BLACK);
+//   tft.setTextDatum(MC_DATUM);
+//   tft.drawString("Connecting...", 120, 120, 4);
 
-  blinker.attach(0.5, tick);
+//   blinker.attach(0.5, tick);
 
-  // WiFi
-  Serial.print("Checking WiFi...");
-  while(wifiMulti.run() != WL_CONNECTED){
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println("\nWiFi Connected!");
-  Serial.print("Connected to: ");
-  Serial.println(WiFi.SSID());
+//   // WiFi
+//   Serial.print("Checking WiFi...");
+//   while(wifiMulti.run() != WL_CONNECTED){
+//     Serial.print(".");
+//     delay(500);
+//   }
+//   Serial.println("\nWiFi Connected!");
+//   Serial.print("Connected to: ");
+//   Serial.println(WiFi.SSID());
   
-  // MQTT
-  client.setServer(mqtt_broker, mqtt_port);
-  client.setCallback(callback);
-  Serial.print("Connecting MQTT...");
+//   // MQTT
+//   client.setServer(mqtt_broker, mqtt_port);
+//   client.setCallback(callback);
+//   Serial.print("Connecting MQTT...");
 
-  while(!client.connected()){
-    String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
-    if(client.connect(clientId.c_str())){
-      Serial.println("\nMQTT Connected!");
-      client.subscribe(mqtt_topic_cmd);
-      client.publish(topic_status, "SYSTEM READY");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state()); // ปริ้น Error Code
-      Serial.println(" try again in 2 seconds");
-      delay(2000);
+//   while(!client.connected()){
+//     String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+//     if(client.connect(clientId.c_str())){
+//       Serial.println("\nMQTT Connected!");
+//       client.subscribe(mqtt_topic_cmd);
+//       client.publish(topic_status, "SYSTEM READY");
+//     } else {
+//       Serial.print("failed, rc=");
+//       Serial.print(client.state()); // ปริ้น Error Code
+//       Serial.println(" try again in 2 seconds");
+//       delay(2000);
+//     }
+//   }
+//   blinker.detach();
+
+//   // พอต่อติดแล้ว ให้วาด UI หลักรอไว้เลย
+//   drawScene_Main();
+// }
+
+// --------------------- Handle Network -------------------------------------
+void handleNetwork(){
+  if(millis() - lastNetworkCheck > 5000){
+    lastNetworkCheck = millis();
+
+    if(wifiMulti.run() != WL_CONNECTED){
+      Serial.println("WiFi lost... reconnecting");
+    }else if(!client.connected()){
+      Serial.print("Attemting MQTT connection");
+      String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+
+      if (client.connect(clientId.c_str())) {
+        Serial.println("Connected!");
+        client.subscribe(mqtt_topic_cmd);
+        client.publish(topic_status, "SYSTEM RECOVERED");
+      } else {
+        Serial.print("failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" (will try again in 5s)");
+      }
     }
   }
-  blinker.detach();
-
-  // พอต่อติดแล้ว ให้วาด UI หลักรอไว้เลย
-  drawScene_Main();
 }
 
 // --------------------- คำนวณระบบ DLI & SOIL -------------------------------
-void calculate(int currentHour){
+void calculate(int currentHour, int currentMin){
   // LIGHT SYSTEM
   float lux = lightMeter.readLightLevel();
   float factor_used;
@@ -403,6 +442,16 @@ void calculate(int currentHour){
   soilPercent = map(rawSoil, AIR_VALUE, WATER_VALUE, 0, 100);
   soilPercent = constrain(soilPercent, 0, 100); // 0 - 100 %
 
+  int currentTimeMins = (currentHour * 60) + currentMin;
+
+  // กำหนดช่วงเวลา (แปลงเป็นนาที)
+  // ตัวอย่าง: ถ้า MORNING_START = 6 คือ 6*60 = 360 นาที (06:00)
+  int morningStartMins = MORNING_START * 60; 
+  int morningEndMins   = MORNING_END * 60;   
+  int eveningStartMins = EVENING_START * 60;
+  int eveningEndMins   = EVENING_END * 60;
+
+  // Light Control
   if(isLightManual){
     isLightOn = (digitalRead(RELAY_LIGHT) == LOW);
   }
@@ -419,7 +468,7 @@ void calculate(int currentHour){
       setRelayState(RELAY_LIGHT, false);
     }
     // ถ้าเป็นตอนเที่ยงคืนให้ Reset ค่า DLI
-    if(currentHour == 0 && current_DLI > 1.0){ // >1.0 เพื่อกัน Reset รัวๆ
+    if(currentHour == 0){
       current_DLI = 0; 
     }
   }
@@ -428,14 +477,14 @@ void calculate(int currentHour){
     isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
   }else{
     // WATER SYSTEM
-    bool isMorning = (currentHour >= MORNING_START && currentHour < MORNING_END);
-    bool isEvening = (currentHour >= EVENING_START && currentHour < EVENING_END);
+    bool isMorning = (currentTimeMins >= morningStartMins && currentTimeMins < morningEndMins);
+    bool isEvening = (currentTimeMins >= eveningStartMins && currentTimeMins < eveningEndMins);
     // ถ้าไม่ได้อยู่ในช่วงเช้าและเย็น
     if(!isMorning && !isEvening){
       setRelayState(RELAY_VALVE_MAIN, false);
       isValveMainOn = false;
-      isMorningDone = false;
-      isEveningDone = false;
+      if(currentTimeMins > morningEndMins) isMorningDone = false;
+      if(currentTimeMins > eveningEndMins || currentTimeMins == 0) isEveningDone = false;
     }
     // ถ้าอยู่ในช่วงเช้าและเย็น
     else{
@@ -499,22 +548,11 @@ void setup() {
 
   tft.init();
   tft.setRotation(1);
-
-  wifiMulti.addAP(ssid_1, pass_1);
-  wifiMulti.addAP(ssid_2, pass_2);
-  wifiMulti.addAP(ssid_3, pass_3);
-
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("BOOTING SYSTEM...", 10, 10, 4);
 
   setRelayState(RELAY_LIGHT, false);
   setRelayState(RELAY_VALVE_MAIN, false);
-    
   pinMode(SOIL_PIN, INPUT);
-  
-  Serial.println("System Ready: All Relays OFF");
-  delay(1000);
 
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)){
     Serial.println(F("BH1750 Ready!"));
@@ -522,40 +560,91 @@ void setup() {
     Serial.print(F("Error initialising BH1750!!"));
   }
 
+  wifiMulti.addAP(ssid_1, pass_1);
+  wifiMulti.addAP(ssid_2, pass_2);
+  wifiMulti.addAP(ssid_3, pass_3);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("CONNECTING WIFI...", 10, 10, 4);
+  tft.drawString("BOOTING SYSTEM...", 10, 40, 4);
+  Serial.print("Connecting WiFi...");
+
+  Serial.println("System Ready: All Relays OFF");
+  delay(1000);
+
+  unsign long startAttempt = millis();
+  bool wifiConnected = false;
+
+  while(millis() - startAttempt < 15000){ // วนรับสัญญาณเน็ต 15 วิ
+    if(wifiMulti.run() == WL_CONNECTED){
+      wifiConnected = true;
+      break;
+    }
+    Serial.print(".");
+    delay(500);
+  }
+  
+  if(wifiConnected){
+    Serial.println("\nWiFi Connected!");
+    tft.fillScreen(TFT_BLACK);
+    tft.drawString("SNSING TIME...", 10, 10, 4);
+    timezoneSync() // ดึงเวลาจาก Server
+  }else{
+    Serial.println("\nWiFi Failed! Entering OFFLINE Mode.");
+    tft.drawString("Can't sysn time. Offline Mode.");
+    delay(2000);
+  }
+
   // Connect Network
-  connect();
-  timezoneSync();
+  // ตั้งค่า Time Server ไว้รอ (มันจะ sync เองใน background เมื่อเน็ตมา)
+  //configTime(25200, 0, "pool.ntp.org"); // UTC+7 = 25200 sec
+
+  drawScene_Main();
+  //Serial.println("Setup Done -> Entering Main Loop");
 }
 
 void loop() {
-  if(!client.connected()){
-    connect();
+  handleNetwork();
+
+  if(client.connected()){
+    client.loop();
   }
-  client.loop();
 
-  if(millis() - lastScreenUpdate > 1000){
-    lastScreenUpdate = millis();
-
-    int currentHour = 0;
-    int currentMin = 0;
-    bool timeValid = false;
+  if(millis() - lastCalcUpdate > 1000){
+    lastCalcUpdate = millis();
 
     struct tm timeinfo;
-    if(getLocalTime(&timeinfo)){
-      currentHour = timeinfo.tm_hour;
-      currentMin = timeinfo.tm_min;
-      timeValid = true;
-      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-      
-
-      // เรียกฟังก์ชันคำนวณ (ไม่งั้น DLI ไม่ขยับ)
-      calculate(currentHour);
-      
+    if(getLocalTime(&timeinfo, 0)){
+      calculate(timeinfo.tm_hour, timeinfo.tm_min);
     }else{
-      Serial.println("Time Sync Failed: Offline");
-      currentHour = 12;
-      timeValid = false;
+      Serial.println("Time Error: System waits for time sync...");
+
+      // ยังคงให้อ่านค่า Sensor เพื่อส่งขึ้นจอ
+      float lux = lightMeter.readLightLevel();
+      int rawSoil = analogRead(SOIL_PIN);
+      soilPercent = map(rawSoil, AIR_VALUE, WATER_VALUE, 0, 100);
+      soilPercent = constrain(soilPercent, 0, 100);
+      
+      // Manual Mode ยังต้องทำงานได้
+      if(isValveManual) isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
+      if(isLightManual) isLightOn = (digitalRead(RELAY_LIGHT) == LOW);
     }
-    updateDisplay_Dynamic(currentHour, currentMin);
+  }
+
+  if(millis() - lastScreenUpdate > 500){ // จออัพเดททุกๆ 0.5 วิ
+    lastScreenUpdate = millis();
+
+    struct tm timeinfo;
+    int h = 0;
+    int m = 0;
+    
+    // ดึงเวลาอีกครั้งเพื่อแสดงผล
+    if(getLocalTime(&timeinfo, 0)){
+      h = timeinfo.tm_hour;
+      m = timeinfo.tm_min;
+      Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S"); // ปริ้นถ้ารกเกินไปก็ปิดได้ครับ
+    }
+    // อัปเดตหน้าจอ
+    updateDisplay_Dynamic(h, m);
   }
 }
