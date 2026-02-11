@@ -775,13 +775,20 @@ void updateValvePulse() {
 
 // --------------------- Water control ---------------------
 void controlWaterResearch(float lux) {
-  if (isValveManual) {
-    isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
-    return;
-  }
-
   soilPercent = getSoilPercentRobust();
 
+  if (isValveManual) {
+    isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
+
+    // กัน state ค้างจาก auto-tune/pulse เมื่อผู้ใช้คุมมือ
+    pulseActive = false;
+    irrState = IRR_IDLE;
+    soilBeforePulse = -1;
+    soilAfterPulse = -1;
+    pulseCycleCount = 0;
+
+    return;
+  }
   // Emergency
   if (soilPercent < SOIL_CRITICAL) {
     isEmergencyMode = true;
