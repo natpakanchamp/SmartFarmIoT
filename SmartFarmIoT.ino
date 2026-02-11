@@ -11,6 +11,7 @@
 #include <Adafruit_ST7789.h>
 #include <Preferences.h> // [เพิ่ม] สำหรับบันทึกค่าลง Flash Memory
 #include <RTClib.h>
+#include <AsyncMqttClient.h>
 
 #define RELAY_LIGHT 4 // แก้ขา Pin ตามที่ใช้งานจริง
 #define SOIL_PIN 34  // ขาอ่านค่าความชื้นดิน (ADC1 Only)
@@ -103,8 +104,9 @@ const char* ssid_3 = "JebHuaJai";
 const char* pass_3 = "ffffffff";
 
 // --------------------- MQTT Config --------------------------------
-const char* mqtt_broker = "test.mosquitto.org";
-//const char* mqtt_broker = "broker.emqx.io";
+// const char* mqtt_broker = "test.mosquitto.org";
+// const char* mqtt_broker = "91.121.93.94";
+const char* mqtt_broker = "broker.emqx.io";
 const int mqtt_port = 1883;
 const char* mqtt_client_id = "Group8/lnwza555"; // คงค่าเดิม
 const char* mqtt_topic_cmd = "group8/command";
@@ -208,6 +210,7 @@ void callback(char* topic, byte* payload, unsigned int length){
   for (int i = 0; i < length; i++){
     msg += (char)payload[i];
   }
+  msg.trim();
   Serial.print(msg);
 
   // สั่งงานผ่านมือถือ (Topic: group8/command)
@@ -640,6 +643,11 @@ void setup() {
 
   if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)){ Serial.println(F("BH1750 Ready!")); } 
   else { Serial.print(F("Error initialising BH1750!!")); }
+
+  // ต้องบอก MQTT Client ก่อนว่าจะไปที่ Server ไหน
+  client.setServer(mqtt_broker, mqtt_port);
+  client.setCallback(callback); // และบอกว่าถ้ามีข้อความมา ให้ไปเรียกฟังก์ชัน callback
+  
 
   // Connect Network
   // ตั้งค่า Time Server ไว้รอ (มันจะ sync เองใน background เมื่อเน็ตมา)
