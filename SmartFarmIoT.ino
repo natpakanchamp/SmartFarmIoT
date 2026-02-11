@@ -12,7 +12,6 @@
 #include <Preferences.h> // [เพิ่ม] สำหรับบันทึกค่าลง Flash Memory
 #include <RTClib.h>
 
-
 #define RELAY_LIGHT 4 // แก้ขา Pin ตามที่ใช้งานจริง
 #define SOIL_PIN 34  // ขาอ่านค่าความชื้นดิน (ADC1 Only)
 #define RELAY_VALVE_MAIN 16 // Soleniod valve ตัวที่ 1 สำหรับเปิดปิดพ่นน้ำ
@@ -82,7 +81,9 @@ unsigned long lastDliSave = 0; // จับเวลาบันทึก DLI
 int lastResetDayKey = -1;
 unsigned long lastTimeResyncAttempt = 0;
 unsigned long lastTelemetry = 0;
+
 unsigned long lastReconnectAttempt = 0;
+bool wasWifiConnected = false;
 
 bool isTimeSynced = false;
 
@@ -347,7 +348,7 @@ void timezoneSync(){
         rtc_time -= 25200; 
     }
 
-    struct timeval tv = { .tv_sec = now.unixtime(), .tv_usec = 0 };
+    struct timeval tv = { .tv_sec = rtc_time, .tv_usec = 0 };
     settimeofday(&tv, NULL); // ตั้งเวลาเข้าระบบ ESP32
     isTimeSynced = true;
     Serial.println("[Time] System time set from RTC.");
@@ -366,6 +367,17 @@ void timezoneSync(){
 
 // --------------------- Handle Network -------------------------------------
 void handleNetwork(){
+  bool isWifiConnected = (wifiMulti.run() == WL_CONNECTED);
+
+  // เช็คว่า "เพิ่งจะ" ต่อเน็ตติดหรือไม่? (Transition from Disconnect -> Connect)
+  if(isWifiConnected && !wasWifiConnected){
+    Serial.println("[Network] Reconnected! Syncing Time immediately...");
+    timezoneSync(); // <--- ซิงค์ทันทีเมื่อเน็ตกลับมา!
+  }
+  // อัปเดตสถานะล่าสุดเก็บไว้เทียบรอบหน้า
+  wasWifiConnected = isWifiConnected;
+
+  // เช็คสถานะ MQTT
   if(millis() - lastNetworkCheck > 5000){
     lastNetworkCheck = millis();
 
@@ -608,7 +620,7 @@ void setup() {
   // isLightManual = preferences.getBool("lMan", false);
 
   tft.init();
-  tft.setRotation(1);
+  // tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
 
   // Init Sprite
@@ -655,21 +667,7 @@ void setup() {
     Serial.print(".");
     delay(500);
   }
-  
-  // if(wifiConnected){
-  //   Serial.println("\nWiFi Connected!");
-  //   tft.fillScreen(TFT_BLACK);
-  //   tft.drawString("SENSING TIME...", 10, 10, 4);
-  //   timezoneSync(); // ดึงเวลาจาก Server
-  // }else{
-  //   Serial.println("\nWiFi Failed! Entering OFFLINE Mode.");
-  //   tft.drawString("Can't sync time.", 10, 10, 4); 
-  //   tft.drawString("Offline Mode.", 10, 40, 4);
-  //   delay(2000);
-  // }
 
-  // เรียก timezoneSync เสมอ ไม่ว่าจะมีเน็ตหรือไม่
-  // เพราะในฟังก์ชันมันมี logic เลือก RTC ให้อยู่แล้ว
   tft.fillScreen(TFT_BLACK);
   tft.drawString("SYNCING TIME...", 10, 10, 4);
   timezoneSync();
