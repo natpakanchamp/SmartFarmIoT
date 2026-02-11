@@ -4,7 +4,6 @@
 #include <WiFiMulti.h>
 #include <PubSubClient.h>
 #include <time.h>
-#include <Ticker.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <Adafruit_GFX.h>
@@ -12,6 +11,7 @@
 #include <Preferences.h> // [เพิ่ม] สำหรับบันทึกค่าลง Flash Memory
 #include <RTClib.h>
 #include <AsyncMqttClient.h>
+#include <math.h>
 
 #define RELAY_LIGHT 4 // แก้ขา Pin ตามที่ใช้งานจริง
 #define SOIL_PIN 34  // ขาอ่านค่าความชื้นดิน (ADC1 Only)
@@ -48,14 +48,31 @@ TFT_eSprite sprite = TFT_eSprite(&tft); // Sprite แก้จอกระพร
 Preferences preferences; // ตัวจัดการหน่วยความจำถาวร
 RTC_DS3231 rtc;
 
-Ticker blinker;
-
 // Variables
 float SUN_FACTOR = 0.0185; 
 float LIGHT_FACTOR = 0.0135; 
 float target_DLI = 12.0; 
 float current_DLI = 0.0;
 bool isLightOn = false;
+
+// ---------- BH1750 retry throttle ----------
+unsigned long lastBhRetryMs = 0;
+const unsigned long BH_RETRY_INTERVAL = 3000UL; // ลอง init ใหม่ทุก 3 วิ เมื่อไม่พร้อม
+
+// ---------- Valve anti-chatter ----------
+unsigned long valveLastSwitchMs = 0;
+const unsigned long VALVE_MIN_ON_MS  = 15000UL; // เปิดอย่างน้อย 15 วิ
+const unsigned long VALVE_MIN_OFF_MS = 30000UL; // ปิดอย่างน้อย 30 วิ
+
+// -------- Lux Filtering & Validation --------
+float luxSmoothed = 0.0f;
+const float luxAlpha = 0.20f;          // EMA ของแสง (0.1-0.3 กำลังดี)
+bool isLuxValid = false;
+float lastValidLux = 0.0f;
+unsigned long lastValidLuxMs = 0;
+const float LUX_MIN_VALID = 0.0f;
+const float LUX_MAX_VALID = 120000.0f; // BH1750 ใช้งานจริงสูงราวนี้
+bool bhReady = false;
 
 // Soil Filtering Variable
 float soilSmoothed = 0;   // ค่าความชื้นที่ผ่านการกรองแล้ว
@@ -71,8 +88,6 @@ bool isValveManual = false;
 bool isLightManual = false;
 bool isEmergencyMode = false; // โหมดฉุกเฉิน
 
-bool isSceneShown = false;
-
 volatile bool alarmTriggered = false;
 bool rtcFound = false;
 unsigned long lastNetworkCheck = 0; // สำหรับเช็คเน็ตโดยไม่บล๊อกการทำงานหลัก
@@ -82,11 +97,19 @@ unsigned long lastDliSave = 0; // จับเวลาบันทึก DLI
 int lastResetDayKey = -1;
 unsigned long lastTimeResyncAttempt = 0;
 unsigned long lastTelemetry = 0;
+unsigned long lastDebug = 0;        // รอบพิมพ์ debug
 
-unsigned long lastReconnectAttempt = 0;
+const unsigned long CONTROL_INTERVAL = 1000UL;   // 1 วินาที
+const unsigned long NETWORK_INTERVAL = 2000UL;   // 2 วินาที
+const unsigned long TELEMETRY_INTERVAL = 10000UL;// 10 วินาที
+const unsigned long DEBUG_INTERVAL = 3000UL;     // 3 วินาที
+
+const bool DEBUG_LOG = true;  // ถ้าร้อน/ช้า ให้เปลี่ยนเป็น false
+
 bool wasWifiConnected = false;
 
 bool isTimeSynced = false;
+float lastSavedDLI = -1.0;
 
 // --------------------- Interrupt ------------------------------------
 void IRAM_ATTR onRTCAlarm(){
@@ -117,18 +140,26 @@ const char* topic_soil = "group8/soil";
 const char* topic_valve = "group8/valve/main";
 const char* topic_lux = "group8/lux";
 
-unsigned long lastScreenUpdate = 0;
-
 // ----------------------- Relay Control Function -----------------
 void setRelayState(int pin, bool active){
-  pinMode(pin, OUTPUT);
-  if(active){
-    // Active LOW สั่งเปิด
-    digitalWrite(pin, LOW);
-  }else{
-    // Active HIGH สั่งปิด
-    digitalWrite(pin, HIGH);
+  // Active LOW: true = ON, false = OFF
+  digitalWrite(pin, active ? LOW : HIGH);
+}
+
+void setValveStateSafe(bool wantOn, bool force = false){
+  unsigned long now = millis();
+  bool curOn = isValveMainOn;
+
+  if (wantOn == curOn) return;
+
+  if (!force) {
+    if (!wantOn && curOn && (now - valveLastSwitchMs < VALVE_MIN_ON_MS)) return;
+    if (wantOn && !curOn && (now - valveLastSwitchMs < VALVE_MIN_OFF_MS)) return;
   }
+
+  setRelayState(RELAY_VALVE_MAIN, wantOn);
+  isValveMainOn = wantOn;
+  valveLastSwitchMs = now;
 }
 
 // --------------------- Sprite Display --------------------------------
@@ -142,7 +173,7 @@ void updateDisplay_Buffered(int h, int m){
   sprite.setTextSize(3);
   sprite.drawString("Soil", 10, 10);
   sprite.drawString("%", 215, 10);
-  sprite.drawString("Lux", 10, 40);
+  sprite.drawString("DLI", 10, 40);
   sprite.drawLine(10, 71, 229, 71, TFT_WHITE);
 
   // วาดค่า Dynamic (ตัวเลข)
@@ -200,6 +231,29 @@ void updateDisplay_Buffered(int h, int m){
   sprite.pushSprite(0, 0);
 }
 
+// --------------------- Command Helpers ------------------------------
+// เปลี่ยนโหมด MAN/AUTO ของอุปกรณ์
+void setManualMode(bool &modeRef, const char* name, bool manual){
+  modeRef = manual;
+  Serial.print("SET MODE: ");
+  Serial.print(name);
+  Serial.println(manual ? " MANUAL" : " AUTO");
+}
+
+// สั่ง ON/OFF เฉพาะเมื่ออยู่ Manual Mode
+void applyManualAction(bool manualMode, int relayPin, bool &stateRef, const char* name, bool turnOn){
+  if(manualMode){
+    setRelayState(relayPin, turnOn);
+    stateRef = turnOn;
+
+    Serial.print("MANUAL: ");
+    Serial.print(name);
+    Serial.println(turnOn ? " ON" : " OFF");
+  } else {
+    Serial.println("System is in AUTO Mode!!");
+  }
+}
+
 // --------------------- Callback Function ------------------------------
 void callback(char* topic, byte* payload, unsigned int length){
   Serial.print("Message [");
@@ -207,7 +261,7 @@ void callback(char* topic, byte* payload, unsigned int length){
   Serial.print("]");
 
   String msg = "";
-  for (int i = 0; i < length; i++){
+  for (unsigned int i = 0; i < length; i++) {
     msg += (char)payload[i];
   }
   msg.trim();
@@ -216,51 +270,22 @@ void callback(char* topic, byte* payload, unsigned int length){
   // สั่งงานผ่านมือถือ (Topic: group8/command)
   if(String(topic) == mqtt_topic_cmd){
   // ควบคุมน้ำเอง
-    if(msg == "VALVE_MANUAL"){ isValveManual = true; Serial.println("SET MODE: VALVE MANUAL");}
-    else if(msg == "VALVE_AUTO"){ isValveManual = false; Serial.println("SET MODE: VALVE AUTO");}
+    if(msg == "VALVE_MANUAL"){ setManualMode(isValveManual, "VALVE", true); }
+    else if(msg == "VALVE_AUTO"){ setManualMode(isValveManual, "VALVE", false); }
     // Action Control ทำงานตอนอยู๋ในโหมด Manual เท่านั้น
     else if(msg == "VALVE_ON"){ 
-      if(isValveManual){
-        setRelayState(RELAY_VALVE_MAIN, true); 
-        isValveMainOn = true; 
-        Serial.println("MANUAL: VALVE ON"); 
-      } else{
-        Serial.println("System is in AUTO Mode!!");
-      }
+      applyManualAction(isValveManual, RELAY_VALVE_MAIN, isValveMainOn, "VALVE", true);
     }
     else if(msg == "VALVE_OFF"){ 
-      if(isValveManual){
-        setRelayState(RELAY_VALVE_MAIN, false); 
-        isValveMainOn = false; 
-        Serial.println("MANUAL: VALVE OFF"); 
-      }
-      else{
-        Serial.println("System is in AUTO Mode!!");
-      }
+      applyManualAction(isValveManual, RELAY_VALVE_MAIN, isValveMainOn, "VALVE", false);
     }
   // ควบคุมไฟเอง
-    else if(msg == "LIGHT_MANUAL"){ isLightManual = true; Serial.println("SET MODE: LIGHT MANUAL"); }
-    else if(msg == "LIGHT_AUTO"){ isLightManual = false; Serial.println("SET MODE: LIGHT AUTO"); }
+    else if(msg == "LIGHT_MANUAL"){ setManualMode(isLightManual, "LIGHT", true);}
+    else if(msg == "LIGHT_AUTO"){ setManualMode(isLightManual, "LIGHT", false); }
     // Action Control ทำงานได้เฉพาะอยู่ในโหมด manual เท่านั้น
-    else if(msg == "LIGHT_ON"){ 
-      if(isLightManual){
-        setRelayState(RELAY_LIGHT, true); 
-        isLightOn = true; 
-        Serial.println("MANUAL: LIGHT ON");
-      }
-      else{
-        Serial.println("System is in AUTO Mode!!");
-      }
-    }else if(msg == "LIGHT_OFF"){
-      if(isLightManual){ 
-        setRelayState(RELAY_LIGHT, false); 
-        isLightOn = false; 
-        Serial.println("MANUAL: LIGHT OFF"); 
-      }
-      else{
-        Serial.println("System is in AUTO Mode!!");
-      }
-    }
+    else if(msg == "LIGHT_ON"){ applyManualAction(isLightManual, RELAY_LIGHT, isLightOn, "LIGHT", true); }
+    else if(msg == "LIGHT_OFF"){ applyManualAction(isLightManual, RELAY_LIGHT, isLightOn, "LIGHT", false); }
+    else { Serial.println("Unknown command."); }
   }
   struct tm timeinfo;
   int h = 0, m = 0;
@@ -272,31 +297,41 @@ void callback(char* topic, byte* payload, unsigned int length){
 }
 
 // --------------------- Time & Alarm ---------------------------------------
-void syncTime(){
-  if(wifiMulti.run() == WL_CONNECTED){
-    configTime(25200, 0, "pool.ntp.org");
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 2000)) { // รอ max 2 วิ
-      Serial.println("[Time] NTP Sync Success!");
-      // อัปเดตลง RTC ทันที เพื่อให้ RTC แม่นยำเสมอ
-      if(rtcFound) {
-        rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
-        Serial.println("[Time] RTC Updated from NTP.");
-      }
-      return;
-    }
-  }
+// void syncTime(){
+//   if(wifiMulti.run() == WL_CONNECTED){
+//     configTime(0, 0, "pool.ntp.org");
+//     struct tm timeinfo;
 
-  // 2. ถ้า NTP พลาด ให้ดึงจาก RTC มาใส่ ESP32
-  if (rtcFound) {
-    DateTime now = rtc.now();
-    struct timeval tv = { .tv_sec = now.unixtime(), .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-    Serial.println("[Time] Recovered time from RTC (Offline Mode).");
-  } else {
-    Serial.println("[Time] Error: No Time Source!");
-  }
-}
+//     if (getLocalTime(&timeinfo, 2000)) { // รอ max 2 วิ
+//       Serial.println("[Time] NTP Sync Success!");
+//       // อัปเดตลง RTC ทันที เพื่อให้ RTC แม่นยำเสมอ
+
+//       if(rtcFound) {
+//         rtc.adjust(DateTime(
+//           timeinfo.tm_year + 1900, 
+//           timeinfo.tm_mon + 1, 
+//           timeinfo.tm_mday, 
+//           timeinfo.tm_hour, 
+//           timeinfo.tm_min, 
+//           timeinfo.tm_sec
+//         ));
+//         Serial.println("[Time] RTC Updated from NTP.");
+//       }
+//       return;
+//     }
+//   }
+
+//   // 2. ถ้า NTP พลาด ให้ดึงจาก RTC มาใส่ ESP32
+//   if (rtcFound) {
+//     DateTime now = rtc.now();
+//     time_t rtc_utc_epoch = now.unixtime() - 7 * 3600;
+//     struct timeval tv = { .tv_sec = rtc_utc_epoch, .tv_usec = 0 };
+//     settimeofday(&tv, NULL);
+//     Serial.println("[Time] Recovered time from RTC (Offline Mode).");
+//   } else {
+//     Serial.println("[Time] Error: No Time Source!");
+//   }
+// }
 
 void setupRTCAlarm() {
   if (!rtcFound) return;
@@ -327,18 +362,25 @@ void setupRTCAlarm() {
 
 // --------------------- Time Zone Setting (UTC+7) ---------------------------
 void timezoneSync(){
-  const char* ntpServer = "pool.ntp.org";
-  const long gmtOffset_sec = 25200;          
-  const int daylightOffset_sec = 0;          
+  const char* ntpServer = "pool.ntp.org";        
   struct tm timeinfo;
 
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  // UTC core
+  configTime(0, 0, ntpServer);
   Serial.println("Waiting for time syncing...");
 
   if(getLocalTime(&timeinfo, 2000)){
     Serial.println("[Time] NTP Sync Success!");
     if(rtcFound){
-      rtc.adjust(DateTime(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec));
+      rtc.adjust(DateTime(
+        timeinfo.tm_year + 1900, 
+        timeinfo.tm_mon + 1, 
+        timeinfo.tm_mday, 
+        timeinfo.tm_hour, 
+        timeinfo.tm_min, 
+        timeinfo.tm_sec
+      ));
+      isTimeSynced = true;
       Serial.println("[Time] Updated RTC with Internet time.");
     }
   }
@@ -346,21 +388,13 @@ void timezoneSync(){
     Serial.println("[Time] NTP Failed. Using RTC time.");
     DateTime now = rtc.now();
 
-    time_t rtc_time = now.unixtime();
-    if(rtc_time > 25200) {
-        rtc_time -= 25200; 
-    }
-
-    struct timeval tv = { .tv_sec = rtc_time, .tv_usec = 0 };
+    // RTC เก็บ local(+7) -> แปลงเป็น UTC ก่อน settimeofday
+    time_t rtc_utc_epoch = now.unixtime() - 7 * 3600;
+    struct timeval tv = { .tv_sec = rtc_utc_epoch, .tv_usec = 0 };
     settimeofday(&tv, NULL); // ตั้งเวลาเข้าระบบ ESP32
+
     isTimeSynced = true;
     Serial.println("[Time] System time set from RTC.");
-
-    // if(rtc.lostPower()){
-    //   Serial.println("RTC lost power!");
-    //   // ถ้า RTC แบตหมดจริงๆ ค่ามันจะเพี้ยน เราอาจจะต้องตั้งค่าเริ่มต้นมั่วๆ ไปก่อนกันแฮงค์
-    //   rtc.adjust(DateTime(2026, 1, 1, 12, 0, 0));
-    // }
   }
   else {
     Serial.println("[Time] Critical: No Time Source!");
@@ -381,12 +415,12 @@ void handleNetwork(){
   wasWifiConnected = isWifiConnected;
 
   // เช็คสถานะ MQTT
-  if(millis() - lastNetworkCheck > 5000){
+  if(millis() - lastNetworkCheck > NETWORK_INTERVAL){
     lastNetworkCheck = millis();
 
-    if(wifiMulti.run() != WL_CONNECTED){ Serial.println("WiFi lost... reconnecting"); }
+    if(!isWifiConnected){ Serial.println("WiFi lost... reconnecting"); }
     else if(!client.connected()){
-      Serial.print("Attemting MQTT connection");
+      Serial.print("Attempting MQTT connection");
       String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
 
       if (client.connect(clientId.c_str())) {
@@ -400,7 +434,7 @@ void handleNetwork(){
       }
     }
     // Auto Sync
-    if(wifiMulti.run() == WL_CONNECTED){
+    if(isWifiConnected){
       if(millis() - lastTimeResyncAttempt > 3600000UL){ // ทุก 1 ชม
         lastTimeResyncAttempt = millis();
         timezoneSync();
@@ -419,9 +453,6 @@ void handleDailyReset(struct tm timeinfo){
     preferences.putInt("savedDay", dayKey);
 
     current_DLI = 0.0;
-
-    // รีเซ็ตค่าใน NVS ด้วย
-    preferences.putFloat("dli", 0.0);
 
     isMorningDone = false;
     isEveningDone = false;
@@ -442,17 +473,73 @@ void reportTelemetry(float lux){
   sprintf(msg, "%d", soilPercent);    client.publish(topic_soil, msg);
   sprintf(msg, "%.2f", lux);          client.publish(topic_lux, msg);
 
+  client.publish(topic_valve, isValveMainOn ? "ON" : "OFF", true); // retain=true
+
   String statusMsg = "V:" + String(isValveManual ? "MAN" : "AUTO") + " | L:" + String(isLightManual ? "MAN" : "AUTO");
   client.publish(topic_status, statusMsg.c_str());
   
   Serial.println("[MQTT] Telemetry Sent >>");
 }
+// ------------------------ อ่านค่า LUX ---------------------------------------------------
+float readLuxSafe() {
+  unsigned long now = millis();
+
+  if (!bhReady) {
+    if (now - lastBhRetryMs >= BH_RETRY_INTERVAL) {
+      lastBhRetryMs = now;
+      bhReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
+      if (bhReady) {
+        Serial.println("[BH1750] Recovered and configured.");
+        luxSmoothed = 0.0f;
+        isLuxValid = false;
+        lastValidLux = 0.0f;
+        lastValidLuxMs = 0;
+      } else {
+        Serial.println("[BH1750] not ready, re-init failed");
+      }
+    }
+    return (float)LUX_SAFE_LIMIT + 1000.0f;
+  }
+
+  float raw = lightMeter.readLightLevel();
+  bool valid = !isnan(raw) && !isinf(raw) && (raw >= LUX_MIN_VALID) && (raw <= LUX_MAX_VALID);
+
+  if (!valid) {
+    isLuxValid = false;
+    bhReady = false; // ให้ไปรอบ retry throttle
+    Serial.println("[Alarm] Lux Sensor Fault/Out-of-range!");
+
+    if (lastValidLuxMs != 0 && (now - lastValidLuxMs) < 60000UL) return lastValidLux;
+    return (float)LUX_SAFE_LIMIT + 1000.0f;
+  }
+
+  if (luxSmoothed <= 0.0f) luxSmoothed = raw;
+  luxSmoothed = (luxAlpha * raw) + ((1.0f - luxAlpha) * luxSmoothed);
+
+  isLuxValid = true;
+  lastValidLux = luxSmoothed;
+  lastValidLuxMs = now;
+  return luxSmoothed;
+}
 
 // --------------------- คำนวณระบบ DLI & SOIL -------------------------------
 void calculate(int currentHour, int currentMin){
   // LIGHT SYSTEM
-  float lux = lightMeter.readLightLevel();
+  float lux = readLuxSafe();
   bool wantLightOn = isLightOn;
+  static unsigned long wifiLostTime = 0;
+  // ---------- ป้องกันเมื่อเวลาเน็ตหลุดแล้วยังอยู่ในโหมด Manual -------------------------
+  if(!client.connected()){
+     if(wifiLostTime == 0) wifiLostTime = millis();
+     
+     if(millis() - wifiLostTime > 30000UL){ // ถ้าหลุดเกิน 30 วิ
+        isValveManual = false;
+        isLightManual = false;
+        // Serial.println("[Fail-safe] Connection lost: Reverting to AUTO mode");
+     }
+  } else {
+     wifiLostTime = 0; // รีเซ็ตตัวจับเวลาเมื่อเน็ตกลับมา
+  }
 
   // --------------- Light Control -------------------------
   if(isLightManual){
@@ -479,13 +566,20 @@ void calculate(int currentHour, int currentMin){
     if(dtSeconds < 0) dtSeconds = 0;
     if(dtSeconds > 5.0f) dtSeconds = 5.0f;
 
+      // ถ้า lux invalid และไฟปลูกไม่ได้เปิด -> ไม่ควรสะสม DLI จากค่าเพี้ยน
+    if (isLuxValid || isLightOn) {
     float factor_used = isLightOn ? LIGHT_FACTOR : SUN_FACTOR;
     float ppfd = lux * factor_used;
     current_DLI += (ppfd * dtSeconds) / 1000000.0f;
+    }
 
-    // บันทึก DLI ลง Flash ทุก 1 นาที กันค่าหายเมื่อไฟดับ 
-    if(millis() - lastDliSave > 60000UL) { // 900,000ms = 15 นาที
-      lastDliSave = millis();
+    // บันทึก DLI ลง Flash ทุก 15 นาที กันค่าหายเมื่อไฟดับ 
+    bool timeToSave = (nowMs - lastDliSave > 900000UL);
+    bool thresholdReached = (fabsf(current_DLI - lastSavedDLI) >= 0.5f);
+
+    if(timeToSave || thresholdReached) { // 900,000ms = 15 นาที
+      lastDliSave = nowMs;
+      lastSavedDLI = current_DLI; // อัปเดตตัวแปรอ้างอิง
       preferences.putFloat("dli", current_DLI);
       Serial.println("[System] DLI Saved to NVS");
     }
@@ -526,74 +620,77 @@ void calculate(int currentHour, int currentMin){
       // WATER SYSTEM
       bool isMorning = (currentTimeMins >= morningStartMins && currentTimeMins < morningEndMins);
       bool isEvening = (currentTimeMins >= eveningStartMins && currentTimeMins < eveningEndMins);
-      // ถ้าไม่ได้อยู่ในช่วงเช้าและเย็น
+
       if(soilPercent < SOIL_CRITICAL){
         isEmergencyMode = true;
-        setRelayState(RELAY_VALVE_MAIN, true);
-        isValveMainOn = true;
+        setValveStateSafe(true, true);
       }
       else if (isEmergencyMode && soilPercent > SOIL_MIN) {
-        // ออกจากโหมดฉุกเฉินเมื่อดินเริ่มชื้น (ถึงจุด SOIL_MIN)
+        // ออกจากโหมดฉุกเฉินเมื่อดินเริ่มชื้น
         isEmergencyMode = false;
-        setRelayState(RELAY_VALVE_MAIN, false);
-        isValveMainOn = false;
+        setValveStateSafe(false);
       }
-    else if (!isEmergencyMode) {
-      // Normal Auto Logic
-      isMorning = (currentTimeMins >= morningStartMins && currentTimeMins < morningEndMins);
-      isEvening = (currentTimeMins >= eveningStartMins && currentTimeMins < eveningEndMins);
-
-      if(!isMorning && !isEvening){
-        setRelayState(RELAY_VALVE_MAIN, false);
-        isValveMainOn = false;
-      }
-      // ถ้าอยู่ในช่วงเช้าและเย็น
-      else{
-        bool *currentDoneFlag = isMorning ? &isMorningDone : &isEveningDone;
-        // เช็คว่าจบการทำงานหรือยัง และแดดปลอดภัยมั้ย
-        if(!(*currentDoneFlag) && lux < LUX_SAFE_LIMIT){
-          // ถ้าดินชุ่มถึงเป้าหมายแล้ว (80%) -> จบงานทันที
-          if (soilPercent >= SOIL_MAX) {
-            setRelayState(RELAY_VALVE_MAIN, false); // ปิดวาล์ว
-            isValveMainOn = false;
-            *currentDoneFlag = true; // ระบบจะไม่รดน้ำอีกต่อไปจนกว่าจะเปลี่ยนรอบ
-            if(isMorning) preferences.putBool("mDone", true); // จำว่าเช้าเสร็จแล้ว
-            if(isEvening) preferences.putBool("eDone", true); // จำว่าเย็นเสร็จแล้ว
-            Serial.println("[Memory] Saved: Watering Done for this period.");
-          }
-          // ถ้าดินแห้งต่ำว่า 40% -> เติมน้ำ
-          else if(soilPercent <= SOIL_MIN){
-            setRelayState(RELAY_VALVE_MAIN, true);
-            isValveMainOn = true;
-          }
-          // ระบบนี้จะทำงานอยู่ในช่วง 41% - 79%
+      else if (!isEmergencyMode) {
+        if(!isMorning && !isEvening){
+          setValveStateSafe(false);
         }
-        // รดน้ำเสร็จแล้ว หรือแดดแรงเกิน -> ปิดวาล์ว
         else{
-          setRelayState(RELAY_VALVE_MAIN, false);
-          isValveMainOn = false;
+          bool *currentDoneFlag = isMorning ? &isMorningDone : &isEveningDone;
+
+          if(!(*currentDoneFlag) && lux < LUX_SAFE_LIMIT){
+            if (soilPercent >= SOIL_MAX) {
+              setValveStateSafe(false);
+              *currentDoneFlag = true;
+
+              if(isMorning){
+                isMorningDone = true;
+                preferences.putBool("mDone", true);
+                Serial.println("[Memory] Moorning Task Saved.");
+              }
+              if (isEvening && !isEveningDone) {
+                isEveningDone = true;
+                preferences.putBool("eDone", true);
+                Serial.println("[Memory] Evening Task Saved.");
+              }
+              Serial.println("[Memory] Saved: Watering Done for this period.");
+            }
+            else if(soilPercent <= SOIL_MIN){
+              setValveStateSafe(true);
+            }
+          }
+          else{
+            setValveStateSafe(false);
+          }
         }
       }
     }
+
+    // ------------------------ Debug Monitor ------------------------
+  if (DEBUG_LOG && (millis() - lastDebug >= DEBUG_INTERVAL)) {
+    lastDebug = millis();
+
+    Serial.println("--- Status ---");
+    Serial.print(" | Lux: "); Serial.println(lux);
+    Serial.print(" | DLI: "); Serial.println(current_DLI);
+
+    Serial.print("Current Hour: "); Serial.println(currentHour);
+    Serial.print(" | Soil: "); Serial.println(soilPercent);
+    Serial.print(" | Light: "); Serial.println(isLightOn);
+    Serial.print(" | Valve: "); Serial.println(isValveMainOn ? "ON" : "OFF");
+    Serial.print(" | M-Done: "); Serial.println(isMorningDone);
+    Serial.print(" | E-Done: "); Serial.println(isEveningDone);
   }
-
-  // ------------------------ Debug Monitor ------------------------
-  Serial.println("--- Status ---");
-  Serial.print(" | Lux: "); Serial.println(lux);
-  Serial.print(" | DLI: "); Serial.println(current_DLI);
-
-  Serial.print("Current Hour: "); Serial.println(currentHour);
-  Serial.print(" | Soil: "); Serial.println(soilPercent);
-  Serial.print(" | Light: "); Serial.println(isLightOn);
-  Serial.print(" | Valve: "); Serial.println(isValveMainOn ? "ON" : "OFF");
-  Serial.print(" | M-Done: "); Serial.println(isMorningDone);
-  Serial.print(" | E-Done: "); Serial.println(isEveningDone);
 }
 
 void setup() {
   Serial.begin(115200);
+  setenv("TZ", "ICT-7", 1); // Thailand UTC+7
+  tzset();
   Serial.println("--- System Starting ---");
   Wire.begin(SDA, SCL);
+
+  bhReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
+  Serial.println(bhReady ? "BH1750 Ready!" : "Error initialising BH1750!!");
 
   // Init RTC
   if (!rtc.begin()) {
@@ -637,12 +734,12 @@ void setup() {
     Serial.println("Sprite created successfully!");
   }
 
-  setRelayState(RELAY_LIGHT, false);
-  setRelayState(RELAY_VALVE_MAIN, false);
+  pinMode(RELAY_LIGHT, OUTPUT);
+  pinMode(RELAY_VALVE_MAIN, OUTPUT);
   pinMode(SOIL_PIN, INPUT);
 
-  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)){ Serial.println(F("BH1750 Ready!")); } 
-  else { Serial.print(F("Error initialising BH1750!!")); }
+  setRelayState(RELAY_LIGHT, false);
+  setRelayState(RELAY_VALVE_MAIN, false);
 
   // ต้องบอก MQTT Client ก่อนว่าจะไปที่ Server ไหน
   client.setServer(mqtt_broker, mqtt_port);
@@ -651,7 +748,7 @@ void setup() {
 
   // Connect Network
   // ตั้งค่า Time Server ไว้รอ (มันจะ sync เองใน background เมื่อเน็ตมา)
-  configTime(25200, 0, "pool.ntp.org"); // UTC+7 = 25200 sec
+  configTime(0, 0, "pool.ntp.org");
 //  wifiMulti.addAP(ssid_1, pass_1);
 //  wifiMulti.addAP(ssid_2, pass_2);
   wifiMulti.addAP(ssid_3, pass_3);
@@ -665,11 +762,9 @@ void setup() {
   delay(1000);
 
   unsigned long startAttempt = millis();
-  bool wifiConnected = false;
 
   while(millis() - startAttempt < 15000){
     if(wifiMulti.run() == WL_CONNECTED){
-      wifiConnected = true; 
       break;
     }
     Serial.print(".");
@@ -682,6 +777,21 @@ void setup() {
 
   updateDisplay_Buffered(12, 00);
   //Serial.println("Setup Done -> Entering Main Loop");
+}
+
+// -------------- Safe mode when time not valid --------------------------
+void handleNoValidTimeSafeMode() {
+  // ถ้าไม่ได้อยู่ manual ให้เข้าสภาวะปลอดภัย
+  if (!isValveManual) {
+    setValveStateSafe(false);
+  }
+  if (!isLightManual) {
+    setRelayState(RELAY_LIGHT, false);
+    isLightOn = false;
+  }
+
+  // ไม่แตะ current_DLI และไม่ทำ schedule/ช่วงเวลาใดๆ
+  Serial.println("[Time] Invalid system time -> Automation paused (safe mode).");
 }
 
 void loop() {
@@ -697,11 +807,11 @@ void loop() {
     // ตรงนี้สามารถใส่ Logic ที่อยากให้ทำทุกๆ "นาทีเป๊ะๆ" ได้
   }
 
-  if(millis() - lastCalcUpdate > 200){
+  if(millis() - lastCalcUpdate > CONTROL_INTERVAL){
     lastCalcUpdate = millis();
 
     struct tm timeinfo;
-    int h = 0;
+    int h = 12;
     int m = 0;
   
     // ดึงเวลาจาก System Clock (ซึ่งถูกตั้งค่าโดย timezoneSync แล้ว ไม่ว่าจากแหล่งไหน)
@@ -710,23 +820,25 @@ void loop() {
     if(validTime){
       h = timeinfo.tm_hour;
       m = timeinfo.tm_min;
+      isTimeSynced = true;
+
       handleDailyReset(timeinfo);
+      calculate(h, m);
     }else{
       Serial.println("Time Error: System waits for time sync...");
-      h = 12;
+      isTimeSynced = false;
+      handleNoValidTimeSafeMode();
     }
-    calculate(h, m);
     updateDisplay_Buffered(h, m);
   }
 
-  // 2. Telemetry (ส่งข้อมูลเข้าเน็ต ทุกๆ 10 วินาที)
+  // Telemetry (ส่งข้อมูลเข้าเน็ต ทุกๆ 10 วินาที)
   // -----------------------------------------------------------
-  if(millis() - lastTelemetry > 10000){ // 1000ms = 10 วินาที
+  if(millis() - lastTelemetry > TELEMETRY_INTERVAL){ // 10000ms = 10 วินาที
     lastTelemetry = millis();
 
     // ต้องอ่านค่าแสงตรงนี้เพื่อส่ง (เพราะเราแยกส่วนกันแล้ว)
-    float currentLux = lightMeter.readLightLevel(); 
+    float currentLux = readLuxSafe();
     reportTelemetry(currentLux);
-    Serial.println("[MQTT] Telemetry Sent");
   }
 }
