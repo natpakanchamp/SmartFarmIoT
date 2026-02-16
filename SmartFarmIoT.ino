@@ -131,7 +131,7 @@ typedef struct __attribute__((packed)) {
 
 // ใส่ MAC ของ Node B (ตัวรับ) ให้ถูกต้อง
 // ตัวอย่าง: 24:6F:28:AA:BB:CC
-uint8_t peerAddress[] = {0xD4, 0xE9, 0xF4, 0xC3, 0x30, 0xD4};
+uint8_t NODE_B_MAC[] = {0xD4, 0xE9, 0xF4, 0xC3, 0x30, 0xD4};
 
 // จะใช้อยู่ channel เดียวกับ Node B (WiFi STA)
 const uint8_t ESPNOW_CHANNEL = 1;
@@ -145,8 +145,8 @@ const unsigned long LUX_TX_INTERVAL_MS  = 1000UL;   // 1s
 uint32_t soilSeq = 0;
 uint32_t luxSeq  = 0;
 
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  (void)mac_addr;
+void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  (void)tx_info;
   if (status != ESP_NOW_SEND_SUCCESS) {
     Serial.println("[ESP-NOW] Send fail");
   }
