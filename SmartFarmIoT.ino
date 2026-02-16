@@ -131,7 +131,7 @@ typedef struct __attribute__((packed)) {
 
 // ใส่ MAC ของ Node B (ตัวรับ) ให้ถูกต้อง
 // ตัวอย่าง: 24:6F:28:AA:BB:CC
-uint8_t NODE_B_MAC[6] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
+uint8_t peerAddress[] = {0xD4, 0xE9, 0xF4, 0xC3, 0x30, 0xD4};
 
 // จะใช้อยู่ channel เดียวกับ Node B (WiFi STA)
 const uint8_t ESPNOW_CHANNEL = 1;
