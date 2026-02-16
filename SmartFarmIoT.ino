@@ -131,7 +131,14 @@ typedef struct __attribute__((packed)) {
   uint16_t soilRaw;     // raw ADC from node A (optional for debug)
   uint32_t uptimeMs;
   uint8_t  sensorOk;    // 1=ok, 0=fault
-} SoilPacket;
+} SoilPacket; // รับมาจาก Node A
+
+typedef struct __attribute__((packed)) {
+  uint32_t seq;
+  float    lux;
+  uint32_t uptimeMs;
+  uint8_t  sensorOk;    // 1=ok, 0=fault
+} LuxPacket; // รับมาจาก Node A
 
 volatile bool hasRemoteSoil = false;
 volatile int remoteSoilPct = 0;
@@ -140,6 +147,14 @@ volatile uint8_t remoteSensorOk = 0;
 volatile unsigned long lastSoilRxMs = 0;
 
 const unsigned long SOIL_RX_TIMEOUT_MS = 15000UL;   // ถ้าเกินนี้ถือว่าลิงก์หาย
+
+volatile bool hasRemoteLux = false;
+volatile float remoteLux = 0.0f;
+volatile uint32_t remoteLuxSeq = 0;
+volatile uint8_t remoteLuxOk = 0;
+volatile unsigned long lastLuxRxMs = 0;
+
+const unsigned long LUX_RX_TIMEOUT_MS = 15000UL;
 
 // 1C:C3:AB:B4:77:CC
 const uint8_t ALLOWED_SENDER_MAC[6] = {0x1C, 0xC3, 0xAB, 0xB4, 0x77, 0xCC}; // แก้เป็น MAC ของ Node A จริง
@@ -856,6 +871,27 @@ bool isRemoteSoilHealthy() {
   return true;
 }
 
+bool isRemoteLuxHealthy() {
+  if (!hasRemoteLux) return false;
+  if ((millis() - lastLuxRxMs) > LUX_RX_TIMEOUT_MS) return false;
+  if (remoteLuxOk != 1) return false;
+  if (isnan(remoteLux) || isinf(remoteLux)) return false;
+  if (remoteLux < LUX_MIN_VALID || remoteLux > LUX_MAX_VALID) return false;
+  return true;
+}
+
+float getLuxForControlAndDLI() {
+  if (isRemoteLuxHealthy()) {
+    float lx;
+    noInterrupts();
+    lx = remoteLux;
+    interrupts();
+    return lx;
+  }
+  // fallback ไป local BH1750 ของ Node B
+  return readLuxSafe();
+}
+
 // --------------------- Water control ---------------------
 void controlWaterResearch(float lux) {
   soilPercent = getSoilPercentForControl();
@@ -1150,7 +1186,8 @@ void calculate(int currentHour, int currentMin) {
 
   int nowMin = currentHour * 60 + currentMin;
 
-  float lux = readLuxSafe();
+  float lux = getLuxForControlAndDLI();
+  isLuxValid = isRemoteLuxHealthy() || (bhReady && !isnan(lux) && !isinf(lux) && lux >= LUX_MIN_VALID && lux <= LUX_MAX_VALID);
   lastLuxForTelemetry = lux;
   hasLastLuxForTelemetry = true;
 
@@ -1226,20 +1263,40 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
   if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return;
 
-  if (len != (int)sizeof(SoilPacket)) return;
+  // ---------- SoilPacket ----------
+  if (len == (int)sizeof(SoilPacket)) {
+    SoilPacket pkt;
+    memcpy(&pkt, data, sizeof(pkt));
 
-  SoilPacket pkt;
-  memcpy(&pkt, data, sizeof(pkt));
+    // validate แบบง่าย
+    if (pkt.soilPct < 0 || pkt.soilPct > 100) return;
 
-  // validate แบบง่าย
-  if (pkt.soilPct < 0 || pkt.soilPct > 100) return;
+    remoteSoilPct = pkt.soilPct;
+    remoteSeq = pkt.seq;
+    remoteSensorOk = pkt.sensorOk;
+    hasRemoteSoil = true;
+    lastSoilRxMs = millis();
+    return;
+  }
 
-  remoteSoilPct = pkt.soilPct;
-  remoteSeq = pkt.seq;
-  remoteSensorOk = pkt.sensorOk;
-  hasRemoteSoil = true;
-  lastSoilRxMs = millis();
+  // ---- LuxPacket ----
+  if (len == (int)sizeof(LuxPacket)) {
+    LuxPacket lp;
+    memcpy(&lp, data, sizeof(lp));
+
+    bool luxOk = (lp.sensorOk == 1) &&
+                 !isnan(lp.lux) && !isinf(lp.lux) &&
+                 (lp.lux >= LUX_MIN_VALID) && (lp.lux <= LUX_MAX_VALID);
+
+    remoteLux = lp.lux;
+    remoteLuxSeq = lp.seq;
+    remoteLuxOk = luxOk ? 1 : 0;
+    hasRemoteLux = true;
+    lastLuxRxMs = millis();
+    return;
+  }
 }
+
 
 // init ESP-NOW receiver on Control Unit (Node B)
 bool initEspNowReceiver() {
