@@ -25,6 +25,9 @@
 #include <Preferences.h>
 #include <RTClib.h>
 #include <math.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <string.h>
 
 // --------------------- Pin Mapping ---------------------
 #define RELAY_LIGHT 4
@@ -73,6 +76,8 @@ unsigned long lastValidLuxMs = 0;
 const float LUX_MIN_VALID = 0.0f;
 const float LUX_MAX_VALID = 120000.0f;
 bool bhReady = false;
+float lastLuxForTelemetry = 0.0f;
+bool hasLastLuxForTelemetry = false;
 
 // --------------------- Soil robust filtering ---------------------
 float soilSmoothedPct = 0.0f;
@@ -95,6 +100,14 @@ float lastSavedDLI = -1.0f;
 bool isLightOn = false;
 int soilPercent = 0;
 
+struct RemoteSoilSnapshot {
+  bool has;
+  int pct;
+  uint32_t seq;
+  uint8_t ok;
+  unsigned long rxMs;
+};
+
 bool isValveMainOn = false;
 bool isValveManual = false;
 bool isLightManual = false;
@@ -110,6 +123,27 @@ void startAdaptivePulseByNeed(int soilNow, int soilTarget, bool force = false);
 void updateAdaptivePulseStateMachine(int currentSoil);
 
 static const char* TZ_INFO = "<+07>-7";   // UTC+7
+
+// --------------------- ESP-NOW (Soil RX from Node A) ---------------------
+typedef struct __attribute__((packed)) {
+  uint32_t seq;
+  int16_t  soilPct;     // 0..100
+  uint16_t soilRaw;     // raw ADC from node A (optional for debug)
+  uint32_t uptimeMs;
+  uint8_t  sensorOk;    // 1=ok, 0=fault
+} SoilPacket;
+
+volatile bool hasRemoteSoil = false;
+volatile int remoteSoilPct = 0;
+volatile uint32_t remoteSeq = 0;
+volatile uint8_t remoteSensorOk = 0;
+volatile unsigned long lastSoilRxMs = 0;
+
+const unsigned long SOIL_RX_TIMEOUT_MS = 15000UL;   // ถ้าเกินนี้ถือว่าลิงก์หาย
+
+// 1C:C3:AB:B4:77:CC
+const uint8_t ALLOWED_SENDER_MAC[6] = {0x1C, 0xC3, 0xAB, 0xB4, 0x77, 0xCC}; // แก้เป็น MAC ของ Node A จริง
+bool isSameMac(const uint8_t* a, const uint8_t* b);
 
 // --------------------- Runtime timers ---------------------
 unsigned long lastNetworkCheck = 0;
@@ -195,6 +229,7 @@ const char* topic_valve = "group8/valve/main";
 const char* topic_lux = "group8/lux";
 const char* topic_phase = "group8/phase";
 const char* topic_day = "group8/day";
+const char* topic_soil_link = "group8/link/soilA";
 
 // --------------------- NVS keys ---------------------
 const char* KEY_DLI = "dli";
@@ -258,6 +293,12 @@ void setValveStateSafe(bool wantOn, bool force = false) {
   setRelayState(RELAY_VALVE_MAIN, wantOn);
   isValveMainOn = wantOn;
   valveLastSwitchMs = now;
+}
+
+void forceValveOffAndResetPulse() {
+  setValveStateSafe(false, true);   // บังคับปิด
+  pulseActive = false;
+  irrState = IRR_IDLE;
 }
 
 // --------------------- Display ---------------------
@@ -346,26 +387,32 @@ void applyManualAction(bool manualMode, int relayPin, bool &stateRef, const char
 
 // --------------------- MQTT callback ---------------------
 void callback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  msg.reserve(length + 2);
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  msg.trim();
+  static char msg[64];
+  unsigned int n = (length < sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
+  memcpy(msg, payload, n);
+  msg[n] = '\0';
+
+  // trim
+  while (n > 0 && (msg[n - 1] == ' ' || msg[n - 1] == '\n' || msg[n - 1] == '\r' || msg[n - 1] == '\t')) {
+    msg[n - 1] = '\0';
+    n--;
+  }
 
   Serial.print("Message [");
   Serial.print(topic);
   Serial.print("] ");
   Serial.println(msg);
 
-  if (String(topic) == mqtt_topic_cmd) {
-    if (msg == "VALVE_MANUAL") setManualMode(isValveManual, "VALVE", true);
-    else if (msg == "VALVE_AUTO") setManualMode(isValveManual, "VALVE", false);
-    else if (msg == "VALVE_ON") applyManualAction(isValveManual, RELAY_VALVE_MAIN, isValveMainOn, "VALVE", true);
-    else if (msg == "VALVE_OFF") applyManualAction(isValveManual, RELAY_VALVE_MAIN, isValveMainOn, "VALVE", false);
+  if (strcmp(topic, mqtt_topic_cmd) == 0) {
+    if (strcmp(msg, "VALVE_MANUAL") == 0) setManualMode(isValveManual, "VALVE", true);
+    else if (strcmp(msg, "VALVE_AUTO") == 0) setManualMode(isValveManual, "VALVE", false);
+    else if (strcmp(msg, "VALVE_ON") == 0) applyManualAction(isValveManual, RELAY_VALVE_MAIN, isValveMainOn, "VALVE", true);
+    else if (strcmp(msg, "VALVE_OFF") == 0) applyManualAction(isValveManual, RELAY_VALVE_MAIN, isValveMainOn, "VALVE", false);
 
-    else if (msg == "LIGHT_MANUAL") setManualMode(isLightManual, "LIGHT", true);
-    else if (msg == "LIGHT_AUTO") setManualMode(isLightManual, "LIGHT", false);
-    else if (msg == "LIGHT_ON") applyManualAction(isLightManual, RELAY_LIGHT, isLightOn, "LIGHT", true);
-    else if (msg == "LIGHT_OFF") applyManualAction(isLightManual, RELAY_LIGHT, isLightOn, "LIGHT", false);
+    else if (strcmp(msg, "LIGHT_MANUAL") == 0) setManualMode(isLightManual, "LIGHT", true);
+    else if (strcmp(msg, "LIGHT_AUTO") == 0) setManualMode(isLightManual, "LIGHT", false);
+    else if (strcmp(msg, "LIGHT_ON") == 0) applyManualAction(isLightManual, RELAY_LIGHT, isLightOn, "LIGHT", true);
+    else if (strcmp(msg, "LIGHT_OFF") == 0) applyManualAction(isLightManual, RELAY_LIGHT, isLightOn, "LIGHT", false);
 
     else Serial.println("Unknown command.");
   }
@@ -419,7 +466,6 @@ void timezoneSync() {
   const char* ntp1 = "pool.ntp.org";
   const char* ntp2 = "time.google.com";
   const char* ntp3 = "time.cloudflare.com";
-  struct tm timeinfo;
 
   configTzTime(TZ_INFO, ntp1, ntp2, ntp3);
 
@@ -482,6 +528,8 @@ void handleNetwork() {
     Serial.print("WiFi.status="); Serial.println(WiFi.status());
     Serial.print("IP="); Serial.println(WiFi.localIP());
     Serial.print("RSSI="); Serial.println(WiFi.RSSI());
+    Serial.print("[WiFi] Channel=");
+    Serial.println(WiFi.channel()); 
   }
   wasWifiConnected = isWifiConnected;
 
@@ -550,6 +598,7 @@ void reportTelemetry(float lux) {
   client.publish(topic_lux, msg);
 
   client.publish(topic_valve, isValveMainOn ? "ON" : "OFF", true);
+  client.publish(topic_soil_link, isRemoteSoilHealthy() ? "OK" : "TIMEOUT", true);
 
   sprintf(msg, "%d", (int)currentPhase);
   client.publish(topic_phase, msg);
@@ -773,9 +822,55 @@ void updateValvePulse() {
   }
 }
 
+RemoteSoilSnapshot getRemoteSoilSnapshot() {
+  RemoteSoilSnapshot s;
+  noInterrupts();
+  s.has = hasRemoteSoil;
+  s.pct = remoteSoilPct;
+  s.seq = remoteSeq;
+  s.ok = remoteSensorOk;
+  s.rxMs = lastSoilRxMs;
+  interrupts();
+  return s;
+}
+
+// --------------------- Helper Soil for Control --------------
+int getSoilPercentForControl() {
+  RemoteSoilSnapshot s = getRemoteSoilSnapshot();
+
+  if (s.has) {
+    unsigned long age = millis() - s.rxMs;
+    if (age <= SOIL_RX_TIMEOUT_MS && s.ok == 1) {
+      return constrain(s.pct, 0, 100);
+    }
+  }
+  return 100;
+}
+
+bool isRemoteSoilHealthy() {
+  RemoteSoilSnapshot s = getRemoteSoilSnapshot();
+
+  if (!s.has) return false;
+  if ((millis() - s.rxMs) > SOIL_RX_TIMEOUT_MS) return false;
+  if (s.ok != 1) return false;
+  return true;
+}
+
 // --------------------- Water control ---------------------
 void controlWaterResearch(float lux) {
-  soilPercent = getSoilPercentRobust();
+  soilPercent = getSoilPercentForControl();
+
+  // ถ้าลิงก์ remote soil หาย ให้ fail-safe: ปิดวาล์ว auto
+  if (!isValveManual && !isRemoteSoilHealthy()) {
+    forceValveOffAndResetPulse();
+
+    // กัน state auto-tune ค้าง
+    soilBeforePulse = -1;
+    soilAfterPulse = -1;
+    pulseCycleCount = 0;
+
+    return; // ข้ามการตัดสินใจรดน้ำรอบนี้
+  }
 
   if (isValveManual) {
     isValveMainOn = (digitalRead(RELAY_VALVE_MAIN) == LOW);
@@ -800,10 +895,8 @@ void controlWaterResearch(float lux) {
   }
 
   if (isEmergencyMode && soilPercent >= phaseCfg.soilLow) {
-    isEmergencyMode = false;
-    setValveStateSafe(false);
-    pulseActive = false;
-    irrState = IRR_IDLE;
+  isEmergencyMode = false;
+  forceValveOffAndResetPulse();
   }
   if (isEmergencyMode) return;
 
@@ -854,7 +947,7 @@ void controlWaterResearch(float lux) {
   }
 
   if (soilPercent >= phaseCfg.soilHigh) {
-    setValveStateSafe(false);
+    forceValveOffAndResetPulse();
     pulseActive = false;
     irrState = IRR_IDLE;
   }
@@ -885,7 +978,7 @@ void controlWaterResearch(float lux) {
   }
 
   if (soilPercent >= phaseCfg.soilHigh) {
-    setValveStateSafe(false);
+    forceValveOffAndResetPulse();
     pulseActive = false;
     pulseCycleCount = 0; 
     irrState = IRR_IDLE;
@@ -917,11 +1010,11 @@ int getSoilTargetMidForPhase() {
   return (int)((phaseCfg.soilLow + phaseCfg.soilHigh) / 2);
 }
 
-float clampf_local(float x, float lo, float hi) {
-  if (x < lo) return lo;
-  if (x > hi) return hi;
-  return x;
-}
+// float clampf_local(float x, float lo, float hi) {
+//   if (x < lo) return lo;
+//   if (x > hi) return hi;
+//   return x;
+// }
 
 float computeAdaptivePulseSec(int soilNow, int soilTarget) {
   PulseModel* pm = getPulseModelByPhase();
@@ -1011,7 +1104,7 @@ void updateAdaptivePulseStateMachine(int currentSoil) {
   if (irrState == IRR_IRRIGATING) {
     if (now >= pulseStopMs) {
       // ปิดวาล์วด้วย logic เดิม
-      setValveStateSafe(false);
+      setValveStateSafe(false, true);
       soakWaitStartMs = now;
       irrState = IRR_SOAK_WAIT;
       Serial.println("[AutoTune] Pulse finished -> soak wait");
@@ -1058,6 +1151,8 @@ void calculate(int currentHour, int currentMin) {
   int nowMin = currentHour * 60 + currentMin;
 
   float lux = readLuxSafe();
+  lastLuxForTelemetry = lux;
+  hasLastLuxForTelemetry = true;
 
   // 1) Light control
   controlLightResearch(nowMin, lux);
@@ -1087,6 +1182,13 @@ void calculate(int currentHour, int currentMin) {
     Serial.print(" | irrState: "); Serial.println((int)irrState);
     Serial.print(" | kWetEst: "); Serial.println(pm ? pm->kWetEst : -1.0f, 4);
     Serial.print(" | lastPulseSec: "); Serial.println(lastComputedPulseSec, 2);
+    RemoteSoilSnapshot s = getRemoteSoilSnapshot();
+    Serial.print("RemoteSoilHealthy: "); Serial.println(isRemoteSoilHealthy() ? "YES" : "NO");
+    Serial.print("RemoteSoilPct: "); Serial.println(s.pct);
+    Serial.print("RemoteSeq: "); Serial.println((unsigned long)s.seq);
+    Serial.print("SoilRxAgeMs: ");
+    if (!s.has) Serial.println(-1);
+    else Serial.println((unsigned long)(millis() - s.rxMs));
   }
 }
 
@@ -1109,11 +1211,59 @@ void printTimeDebugBoth() {
     tmLoc.tm_hour, tmLoc.tm_min, tmLoc.tm_sec);
 }
 
+// ------------------ Compare MAC Address Node A ------------------------
+bool isSameMac(const uint8_t* a, const uint8_t* b) {
+  for (int i = 0; i < 6; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
+// -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
+void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (!info || !data) return;
+
+  // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
+  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return;
+
+  if (len != (int)sizeof(SoilPacket)) return;
+
+  SoilPacket pkt;
+  memcpy(&pkt, data, sizeof(pkt));
+
+  // validate แบบง่าย
+  if (pkt.soilPct < 0 || pkt.soilPct > 100) return;
+
+  remoteSoilPct = pkt.soilPct;
+  remoteSeq = pkt.seq;
+  remoteSensorOk = pkt.sensorOk;
+  hasRemoteSoil = true;
+  lastSoilRxMs = millis();
+}
+
+// init ESP-NOW receiver on Control Unit (Node B)
+bool initEspNowReceiver() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] init failed");
+    return false;
+  }
+
+  if (esp_now_register_recv_cb(onEspNowRecv) != ESP_OK) {
+    Serial.println("[ESP-NOW] register recv cb failed");
+    return false;
+  }
+
+  Serial.println("[ESP-NOW] Receiver ready");
+  return true;
+}
+
 // --------------------- Setup ---------------------
 void setup() {
   Serial.begin(115200);
   setenv("TZ", TZ_INFO, 1); // Thailand UTC+7
   tzset();
+  // ใช้ STA เพื่อทำงานร่วมกับ WiFi + MQTT ได้
+  WiFi.mode(WIFI_STA);
 
   Serial.println("\n--- System Starting ---");
   Wire.begin(SDA, SCL);
@@ -1171,7 +1321,7 @@ void setup() {
   // I/O
   pinMode(RELAY_LIGHT, OUTPUT);
   pinMode(RELAY_VALVE_MAIN, OUTPUT);
-  pinMode(SOIL_PIN, INPUT);
+  // pinMode(SOIL_PIN, INPUT); ย้ายไป node A แล้ว
 
   setRelayState(RELAY_LIGHT, false);
   setRelayState(RELAY_VALVE_MAIN, false);
@@ -1179,6 +1329,11 @@ void setup() {
   // MQTT
   client.setServer(mqtt_broker, mqtt_port);
   client.setCallback(callback);
+
+  // Init ESP-NOW receiver (Node B)
+  if (!initEspNowReceiver()) {
+    Serial.println("[ESP-NOW] Receiver init error");
+  }
 
   // WiFi
   wifiMulti.addAP(ssid_3, pass_3);
@@ -1280,7 +1435,7 @@ void loop() {
   // Telemetry loop
   if (millis() - lastTelemetry > TELEMETRY_INTERVAL) {
     lastTelemetry = millis();
-    float currentLux = readLuxSafe();
+    float currentLux = hasLastLuxForTelemetry ? lastLuxForTelemetry : readLuxSafe();
     reportTelemetry(currentLux);
   }
 }
