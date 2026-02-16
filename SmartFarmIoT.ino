@@ -134,7 +134,7 @@ typedef struct __attribute__((packed)) {
 uint8_t NODE_B_MAC[] = {0xD4, 0xE9, 0xF4, 0xC3, 0x30, 0xD4};
 
 // จะใช้อยู่ channel เดียวกับ Node B (WiFi STA)
-const uint8_t ESPNOW_CHANNEL = 1;
+const uint8_t ESPNOW_CHANNEL = 6;
 
 // --------------------- Send scheduling ---------------------
 unsigned long lastSoilTxMs = 0;
