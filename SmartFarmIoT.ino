@@ -125,7 +125,13 @@ void updateAdaptivePulseStateMachine(int currentSoil);
 static const char* TZ_INFO = "<+07>-7";   // UTC+7
 
 // --------------------- ESP-NOW (Soil RX from Node A) ---------------------
+enum MsgType : uint8_t {
+  MSG_SOIL = 1,
+  MSG_LUX  = 2
+};
+
 typedef struct __attribute__((packed)) {
+  uint8_t  msgType;
   uint32_t seq;
   int16_t  soilPct;     // 0..100
   uint16_t soilRaw;     // raw ADC from node A (optional for debug)
@@ -134,6 +140,7 @@ typedef struct __attribute__((packed)) {
 } SoilPacket; // รับมาจาก Node A
 
 typedef struct __attribute__((packed)) {
+  uint8_t  msgType;
   uint32_t seq;
   float    lux;
   uint32_t uptimeMs;
@@ -1258,17 +1265,16 @@ bool isSameMac(const uint8_t* a, const uint8_t* b) {
 
 // -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  if (!info || !data) return;
+  if (!info || !data || len < 1) return;
+  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return; // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
 
-  // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
-  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return;
+  uint8_t type = data[0];
 
   // ---------- SoilPacket ----------
-  if (len == (int)sizeof(SoilPacket)) {
+  if (type == MSG_SOIL && len == (int)sizeof(SoilPacket)) {
     SoilPacket pkt;
     memcpy(&pkt, data, sizeof(pkt));
 
-    // validate แบบง่าย
     if (pkt.soilPct < 0 || pkt.soilPct > 100) return;
 
     remoteSoilPct = pkt.soilPct;
@@ -1276,11 +1282,14 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     remoteSensorOk = pkt.sensorOk;
     hasRemoteSoil = true;
     lastSoilRxMs = millis();
+
+    Serial.printf("[RX SOIL] seq=%lu pct=%d ok=%u\n",
+                  (unsigned long)pkt.seq, (int)pkt.soilPct, (unsigned)pkt.sensorOk);
     return;
   }
 
   // ---- LuxPacket ----
-  if (len == (int)sizeof(LuxPacket)) {
+  if (type == MSG_LUX && len == (int)sizeof(LuxPacket)) {
     LuxPacket lp;
     memcpy(&lp, data, sizeof(lp));
 
@@ -1293,8 +1302,11 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     remoteLuxOk = luxOk ? 1 : 0;
     hasRemoteLux = true;
     lastLuxRxMs = millis();
+    Serial.printf("[RX LUX ] seq=%lu lux=%.2f ok=%u\n",
+                  (unsigned long)lp.seq, lp.lux, (unsigned)remoteLuxOk);
     return;
   }
+  Serial.printf("[ESP-NOW] Unknown packet type=%u len=%d\n", (unsigned)type, len);
 }
 
 
