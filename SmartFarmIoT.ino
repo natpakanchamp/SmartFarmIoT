@@ -896,7 +896,7 @@ float getLuxForControlAndDLI() {
     return lx;
   }
   // fallback ไป local BH1750 ของ Node B
-  return readLuxSafe();
+  return NAN;
 }
 
 // --------------------- Water control ---------------------
@@ -1194,7 +1194,23 @@ void calculate(int currentHour, int currentMin) {
   int nowMin = currentHour * 60 + currentMin;
 
   float lux = getLuxForControlAndDLI();
-  isLuxValid = isRemoteLuxHealthy() || (bhReady && !isnan(lux) && !isinf(lux) && lux >= LUX_MIN_VALID && lux <= LUX_MAX_VALID);
+  bool luxOk = !isnan(lux) && !isinf(lux) && lux >= LUX_MIN_VALID && lux <= LUX_MAX_VALID;
+  isLuxValid = luxOk;
+
+  // ถ้า lux ไม่โอเค: เลือก policy เดียวให้ชัด
+  if (!luxOk) {
+    // ตัวอย่าง policy: ปิดไฟอัตโนมัติและข้าม DLI รอบนี้
+    if (!isLightManual) {
+      setRelayState(RELAY_LIGHT, false);
+      isLightOn = false;
+    }
+    // soil control ยังเดินต่อได้ (เพราะใช้ remote soil)
+    controlWaterResearch(0.0f);
+    lastLuxForTelemetry = NAN;
+    hasLastLuxForTelemetry = true;
+    return;
+  }
+
   lastLuxForTelemetry = lux;
   hasLastLuxForTelemetry = true;
 
@@ -1336,10 +1352,6 @@ void setup() {
 
   Serial.println("\n--- System Starting ---");
   Wire.begin(SDA, SCL);
-
-  // Sensors
-  bhReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
-  Serial.println(bhReady ? "BH1750 Ready!" : "Error initializing BH1750");
 
   // RTC
   if (!rtc.begin()) {
