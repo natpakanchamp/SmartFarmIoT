@@ -112,8 +112,13 @@ float readLuxSafe(bool &ok) {
 }
 
 // --------------------- ESP-NOW Packet ---------------------
+enum MsgType : uint8_t {
+  MSG_SOIL = 1,
+  MSG_LUX  = 2
+};
 // ต้องตรงกับ Node B
 typedef struct __attribute__((packed)) {
+  uint8_t  msgType;
   uint32_t seq;
   int16_t  soilPct;     // 0..100
   uint16_t soilRaw;     // raw ADC
@@ -123,6 +128,7 @@ typedef struct __attribute__((packed)) {
 
 // (เสริม) packet แสง แยกอีกตัว หากอนาคต Node B อยากรับด้วย
 typedef struct __attribute__((packed)) {
+  uint8_t  msgType;
   uint32_t seq;
   float    lux;
   uint32_t uptimeMs;
@@ -189,6 +195,7 @@ void sendSoilPacket() {
   pkt.soilRaw = raw;
   pkt.uptimeMs = millis();
   pkt.sensorOk = soilOk ? 1 : 0;
+  pkt.msgType = MSG_SOIL;
 
   esp_err_t r = esp_now_send(NODE_B_MAC, (uint8_t*)&pkt, sizeof(pkt));
   if (r != ESP_OK) {
@@ -208,6 +215,7 @@ void sendLuxPacket() {
   pkt.lux = luxOk ? lux : NAN;
   pkt.uptimeMs = millis();
   pkt.sensorOk = luxOk ? 1 : 0;
+  pkt.msgType = MSG_LUX;
 
   // ใช้ send ปลายทางเดียวกัน (Node B ตอนนี้ยังไม่ได้ parse packet นี้)
   esp_err_t r = esp_now_send(NODE_B_MAC, (uint8_t*)&pkt, sizeof(pkt));
