@@ -31,7 +31,6 @@
 
 // --------------------- Pin Mapping ---------------------
 #define RELAY_LIGHT 4
-#define SOIL_PIN 34
 #define RELAY_VALVE_MAIN 16
 #define SQW_PIN 27
 
@@ -66,6 +65,9 @@ const unsigned long BH_RETRY_INTERVAL = 3000UL;
 unsigned long valveLastSwitchMs = 0;
 const unsigned long VALVE_MIN_ON_MS = 15000UL;
 const unsigned long VALVE_MIN_OFF_MS = 30000UL;
+
+// --------------------- UI Status line ---------------------
+String uiReason = "System booting";
 
 // --------------------- Lux filtering ---------------------
 float luxSmoothed = 0.0f;
@@ -252,6 +254,7 @@ const char* topic_lux = "group8/lux";
 const char* topic_phase = "group8/phase";
 const char* topic_day = "group8/day";
 const char* topic_soil_link = "group8/link/soilA";
+const char* topic_light = "group8/light/main";
 
 // --------------------- NVS keys ---------------------
 const char* KEY_DLI = "dli";
@@ -286,6 +289,22 @@ PhaseParams PHASE_TABLE[3] = {
 
 GrowPhase currentPhase = PHASE_1_ESTABLISH;
 PhaseParams phaseCfg = PHASE_TABLE[0];
+
+uint16_t colorByBool(bool ok) {
+  return ok ? TFT_GREEN : TFT_RED;
+}
+
+uint16_t colorByLevel(int value, int low, int high) {
+  if (value < low) return TFT_ORANGE;  // ต่ำกว่าเป้า
+  if (value > high) return TFT_CYAN;   // สูงกว่าเป้า
+  return TFT_GREEN;                    // อยู่ในช่วงเป้า
+}
+
+const char* phaseText(GrowPhase p) {
+  if (p == PHASE_1_ESTABLISH) return "P1";
+  if (p == PHASE_2_VEGETATIVE) return "P2";
+  return "P3";
+}
 
 // วันเริ่มปลูก (local epoch)
 time_t transplantEpoch = 0;
@@ -323,66 +342,36 @@ void forceValveOffAndResetPulse() {
   irrState = IRR_IDLE;
 }
 
+// --------------------- UI Paging ---------------------
+uint8_t uiPage = 0; // 0=OPERATE,1=HEALTH,2=CONTROL
+unsigned long lastUiPageMs = 0;
+const unsigned long UI_PAGE_INTERVAL_MS = 6000UL;
+
 // --------------------- Display ---------------------
 void updateDisplay_Buffered(int h, int m) {
+  // auto paging
+  if (millis() - lastUiPageMs >= UI_PAGE_INTERVAL_MS) {
+    lastUiPageMs = millis();
+    uiPage = (uiPage + 1) % 3;
+  }
+
   sprite.fillSprite(TFT_BLACK);
-  sprite.setTextDatum(TL_DATUM);
 
-  // Static
-  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
-  sprite.setTextSize(3);
-  sprite.drawString("Soil", 10, 10);
-  sprite.drawString("%", 215, 10);
-  sprite.drawString("DLI", 10, 40);
-  sprite.drawLine(10, 71, 229, 71, TFT_WHITE);
+  drawHeader(h, m);
 
-  // Dynamic
-  sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
-  sprite.setTextDatum(TR_DATUM);
-  sprite.drawNumber(soilPercent, 200, 10);
-  sprite.drawFloat(current_DLI, 2, 200, 40);
+  if (uiPage == 0) {
+    drawPageOperate();
+  } else if (uiPage == 1) {
+    drawPageHealth();
+  } else {
+    drawPageControl();
+  }
 
-  // Labels
-  sprite.setTextSize(2);
-  sprite.setTextDatum(TL_DATUM);
-  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
-  sprite.drawString("VALVE", 49, 85);
-  sprite.drawString("LIGHT", 164, 85);
-
-  // Mode circles
-  uint16_t valveModeColor = isValveManual ? TFT_ORANGE : TFT_CYAN;
-  sprite.fillEllipse(62, 122, 23, 23, valveModeColor);
-  sprite.setTextColor(TFT_BLACK, valveModeColor);
-  sprite.setTextDatum(MC_DATUM);
+  // footer page index
+  sprite.setTextDatum(BC_DATUM);
   sprite.setTextSize(1);
-  sprite.drawString(isValveManual ? "MAN" : "AUTO", 62, 122);
-
-  uint16_t lightModeColor = isLightManual ? TFT_ORANGE : TFT_CYAN;
-  sprite.fillEllipse(177, 122, 23, 23, lightModeColor);
-  sprite.setTextColor(TFT_BLACK, lightModeColor);
-  sprite.drawString(isLightManual ? "MAN" : "AUTO", 177, 122);
-
-  // ON/OFF indicators
-  sprite.fillEllipse(34, 184, 20, 20, isValveMainOn ? TFT_GREEN : TFT_BLACK);
-  sprite.fillEllipse(91, 184, 20, 20, isValveMainOn ? TFT_BLACK : TFT_RED);
-
-  sprite.fillEllipse(148, 184, 20, 20, isLightOn ? TFT_GREEN : TFT_BLACK);
-  sprite.fillEllipse(205, 184, 20, 20, isLightOn ? TFT_BLACK : TFT_RED);
-
-  // Indicator labels
-  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
-  sprite.drawString("ON", 34, 160);
-  sprite.drawString("OFF", 91, 160);
-  sprite.drawString("ON", 148, 160);
-  sprite.drawString("OFF", 205, 160);
-
-  // Time
-  sprite.setTextSize(2);
-  sprite.setTextColor(TFT_CYAN, TFT_BLACK);
-  sprite.setTextDatum(BR_DATUM);
-  char timeStr[10];
-  sprintf(timeStr, "%02d:%02d", h, m);
-  sprite.drawString(timeStr, 235, 235);
+  sprite.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  sprite.drawString(String(uiPage + 1) + "/3", 120, 238);
 
   sprite.pushSprite(0, 0);
 }
@@ -620,6 +609,7 @@ void reportTelemetry(float lux) {
   client.publish(topic_lux, msg);
 
   client.publish(topic_valve, isValveMainOn ? "ON" : "OFF", true);
+  client.publish(topic_light, isLightOn ? "ON" : "OFF", true);
   client.publish(topic_soil_link, isRemoteSoilHealthy() ? "OK" : "TIMEOUT", true);
 
   sprintf(msg, "%d", (int)currentPhase);
@@ -709,50 +699,6 @@ void applyPhaseConfig(GrowPhase p) {
 
 bool inPhotoperiodNow(int nowMin) {
   return (nowMin >= phaseCfg.photoStartMin && nowMin < phaseCfg.photoEndMin);
-}
-
-// --------------------- Soil robust read ---------------------
-int median5(int a, int b, int c, int d, int e) {
-  int arr[5] = {a, b, c, d, e};
-  for (int i = 1; i < 5; i++) {
-    int key = arr[i], j = i - 1;
-    while (j >= 0 && arr[j] > key) {
-      arr[j + 1] = arr[j];
-      j--;
-    }
-    arr[j + 1] = key;
-  }
-  return arr[2];
-}
-
-bool isRawSoilFault(int raw) {
-  return (raw > 3500 || raw < 100);
-}
-
-int rawToPercent(int raw) {
-  int p = map(raw, AIR_VALUE, WATER_VALUE, 0, 100);
-  return constrain(p, 0, 100);
-}
-
-int getSoilPercentRobust() {
-  int r1 = analogRead(SOIL_PIN);
-  int r2 = analogRead(SOIL_PIN);
-  int r3 = analogRead(SOIL_PIN);
-  int r4 = analogRead(SOIL_PIN);
-  int r5 = analogRead(SOIL_PIN);
-  int raw = median5(r1, r2, r3, r4, r5);
-
-  if (isRawSoilFault(raw)) {
-    Serial.println("[Alarm] Soil sensor fault detected");
-    return 100;  // fail-safe
-  }
-
-  int p = rawToPercent(raw);
-
-  if (soilSmoothedPct <= 0.01f) soilSmoothedPct = (float)p;
-  soilSmoothedPct = soilAlpha * p + (1.0f - soilAlpha) * soilSmoothedPct;
-
-  return constrain((int)roundf(soilSmoothedPct), 0, 100);
 }
 
 // --------------------- DLI integration ---------------------
@@ -882,8 +828,14 @@ bool isRemoteLuxHealthy() {
   if (!hasRemoteLux) return false;
   if ((millis() - lastLuxRxMs) > LUX_RX_TIMEOUT_MS) return false;
   if (remoteLuxOk != 1) return false;
-  if (isnan(remoteLux) || isinf(remoteLux)) return false;
-  if (remoteLux < LUX_MIN_VALID || remoteLux > LUX_MAX_VALID) return false;
+
+  float lx;
+  noInterrupts();
+  lx = remoteLux;
+  interrupts();
+
+  if (isnan(lx) || isinf(lx)) return false;
+  if (lx < LUX_MIN_VALID || lx > LUX_MAX_VALID) return false;
   return true;
 }
 
@@ -905,6 +857,7 @@ void controlWaterResearch(float lux) {
 
   // ถ้าลิงก์ remote soil หาย ให้ fail-safe: ปิดวาล์ว auto
   if (!isValveManual && !isRemoteSoilHealthy()) {
+    uiReason = "Failsafe: remote soil timeout";
     forceValveOffAndResetPulse();
 
     // กัน state auto-tune ค้าง
@@ -929,6 +882,7 @@ void controlWaterResearch(float lux) {
   }
   // Emergency
   if (soilPercent < SOIL_CRITICAL) {
+    uiReason = "Emergency watering: soil critical";
     isEmergencyMode = true;
     setValveStateSafe(true, true);
 
@@ -1124,8 +1078,11 @@ void startAdaptivePulseByNeed(int soilNow, int soilTarget, bool force) {
 
   // ถ้าวาล์วไม่เปิดจริง (โดน min-off block) อย่าเปลี่ยน state machine
   if (!after) {
+    uiReason = "Irrigation blocked: min-off guard";
     Serial.println("[AutoTune] Pulse request blocked by anti-chatter/min-off");
     return;
+  }else{
+    uiReason = "Irrigation pulse start " + String(pulseSec, 1) + "s";
   }
 
   pulseStartMs = millis();
@@ -1340,6 +1297,172 @@ bool initEspNowReceiver() {
 
   Serial.println("[ESP-NOW] Receiver ready");
   return true;
+}
+
+void drawHeader(int h, int m) {
+  // แถบบน
+  sprite.fillRoundRect(4, 4, 232, 30, 6, TFT_DARKGREY);
+
+  // เวลา
+  char ts[6];
+  sprintf(ts, "%02d:%02d", h, m);
+  sprite.setTextDatum(TR_DATUM);
+  sprite.setTextColor(TFT_CYAN, TFT_DARKGREY);
+  sprite.setTextSize(2);
+  sprite.drawString(ts, 232, 12);
+
+  // MODE + PHASE
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  String mode = String(isValveManual || isLightManual ? "MANUAL" : "AUTO");
+  String ph = String("PH:") + phaseText(currentPhase);
+  sprite.drawString(mode + "  " + ph, 10, 12);
+
+  // Alarm dot
+  bool warn = (!isRemoteSoilHealthy()) || (!isRemoteLuxHealthy()) || isEmergencyMode || (!isTimeSynced);
+  uint16_t dot = warn ? TFT_RED : TFT_GREEN;
+  sprite.fillCircle(210, 19, 5, dot);
+}
+
+void drawPageOperate() {
+  // Soil big card
+  sprite.fillRoundRect(8, 40, 108, 74, 10, TFT_NAVY);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(TFT_WHITE, TFT_NAVY);
+  sprite.setTextSize(1);
+  sprite.drawString("SOIL %", 16, 48);
+
+  uint16_t soilCol = colorByLevel(soilPercent, phaseCfg.soilLow, phaseCfg.soilHigh);
+  sprite.setTextColor(soilCol, TFT_NAVY);
+  sprite.setTextSize(4);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.drawNumber(soilPercent, 62, 84);
+
+  // Lux card
+  sprite.fillRoundRect(124, 40, 108, 74, 10, TFT_DARKGREEN);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  sprite.setTextSize(1);
+  sprite.drawString("LUX", 132, 48);
+  sprite.setTextSize(2);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextColor(TFT_YELLOW, TFT_DARKGREEN);
+  String luxText = "N/A";
+  if (!isnan(lastLuxForTelemetry) && !isinf(lastLuxForTelemetry)) {
+    luxText = String((int)lastLuxForTelemetry);
+  }
+  sprite.drawString(luxText, 178, 84);
+
+  // DLI card (กว้างเต็ม)
+  sprite.fillRoundRect(8, 120, 224, 46, 10, TFT_MAROON);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(TFT_WHITE, TFT_MAROON);
+  sprite.drawString("DLI TODAY / TARGET", 16, 128);
+
+  sprite.setTextDatum(TR_DATUM);
+  sprite.setTextSize(2);
+  float dliLeft = current_DLI;
+  float dliRight = phaseCfg.dliTarget;
+  uint16_t dliCol = (dliLeft >= dliRight - 0.1f) ? TFT_GREEN : TFT_ORANGE;
+  sprite.setTextColor(dliCol, TFT_MAROON);
+  sprite.drawString(String(dliLeft, 1) + " / " + String(dliRight, 1), 224, 152);
+
+  // Valve / Light state pills
+  sprite.fillRoundRect(8, 172, 108, 32, 8, TFT_BLACK);
+  sprite.drawRoundRect(8, 172, 108, 32, 8, TFT_WHITE);
+  sprite.setTextDatum(MC_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+  sprite.drawString("VALVE", 38, 188);
+  sprite.setTextColor(isValveMainOn ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  sprite.drawString(isValveMainOn ? "ON" : "OFF", 88, 188);
+
+  sprite.fillRoundRect(124, 172, 108, 32, 8, TFT_BLACK);
+  sprite.drawRoundRect(124, 172, 108, 32, 8, TFT_WHITE);
+  sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+  sprite.drawString("LIGHT", 154, 188);
+  sprite.setTextColor(isLightOn ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  sprite.drawString(isLightOn ? "ON" : "OFF", 204, 188);
+
+  // Reason bar
+  sprite.fillRoundRect(8, 208, 224, 28, 8, TFT_DARKGREY);
+  sprite.setTextDatum(TL_DATUM);
+  sprite.setTextSize(1);
+  sprite.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  String s = uiReason;
+  if (s.length() > 34) s = s.substring(0, 34);
+  sprite.drawString(s, 14, 218);
+}
+
+void drawPageHealth() {
+  sprite.setTextSize(1);
+  sprite.setTextDatum(TL_DATUM);
+
+  sprite.fillRoundRect(8, 40, 224, 196, 10, TFT_BLACK);
+  sprite.drawRoundRect(8, 40, 224, 196, 10, TFT_WHITE);
+
+  int y = 50;
+  auto row = [&](const char* k, String v, uint16_t c) {
+    sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    sprite.drawString(k, 16, y);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.setTextColor(c, TFT_BLACK);
+    sprite.drawString(v, 224, y);
+    sprite.setTextDatum(TL_DATUM);
+    y += 20;
+  };
+
+  unsigned long soilAge = hasRemoteSoil ? (millis() - lastSoilRxMs) : 999999;
+  unsigned long luxAge  = hasRemoteLux  ? (millis() - lastLuxRxMs)  : 999999;
+
+  row("Soil Link", isRemoteSoilHealthy() ? "OK" : "TIMEOUT", colorByBool(isRemoteSoilHealthy()));
+  row("Soil Rx Age", String(soilAge) + " ms", (soilAge <= SOIL_RX_TIMEOUT_MS) ? TFT_GREEN : TFT_RED);
+  row("Soil SensorOK", String(remoteSensorOk), colorByBool(remoteSensorOk == 1));
+
+  row("Lux Link", isRemoteLuxHealthy() ? "OK" : "TIMEOUT", colorByBool(isRemoteLuxHealthy()));
+  row("Lux Rx Age", String(luxAge) + " ms", (luxAge <= LUX_RX_TIMEOUT_MS) ? TFT_GREEN : TFT_RED);
+  row("Lux SensorOK", String(remoteLuxOk), colorByBool(remoteLuxOk == 1));
+
+  row("WiFi", (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "LOST", colorByBool(WiFi.status() == WL_CONNECTED));
+  row("MQTT", client.connected() ? "CONNECTED" : "LOST", colorByBool(client.connected()));
+  row("Time Sync", isTimeSynced ? "OK" : "INVALID", colorByBool(isTimeSynced));
+}
+
+void drawPageControl() {
+  sprite.fillRoundRect(8, 40, 224, 196, 10, TFT_BLACK);
+  sprite.drawRoundRect(8, 40, 224, 196, 10, TFT_WHITE);
+
+  sprite.setTextSize(1);
+  sprite.setTextDatum(TL_DATUM);
+
+  int y = 50;
+  auto row = [&](const char* k, String v, uint16_t c = TFT_CYAN) {
+    sprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    sprite.drawString(k, 16, y);
+    sprite.setTextDatum(TR_DATUM);
+    sprite.setTextColor(c, TFT_BLACK);
+    sprite.drawString(v, 224, y);
+    sprite.setTextDatum(TL_DATUM);
+    y += 20;
+  };
+
+  row("Soil Band", String(phaseCfg.soilLow) + "-" + String(phaseCfg.soilHigh), TFT_YELLOW);
+  row("Photo", 
+      String(phaseCfg.photoStartMin / 60) + ":" + (phaseCfg.photoStartMin % 60 < 10 ? "0" : "") + String(phaseCfg.photoStartMin % 60)
+      + " - " +
+      String(phaseCfg.photoEndMin / 60) + ":" + (phaseCfg.photoEndMin % 60 < 10 ? "0" : "") + String(phaseCfg.photoEndMin % 60),
+      TFT_YELLOW);
+
+  row("DLI Target", String(phaseCfg.dliTarget, 1), TFT_YELLOW);
+  row("DryBack", phaseCfg.dryBackMode ? "ON" : "OFF", phaseCfg.dryBackMode ? TFT_GREEN : TFT_ORANGE);
+
+  PulseModel* pm = getPulseModelByPhase();
+  row("AutoTune", AUTO_TUNE_PULSE_ENABLED ? "ON" : "OFF", AUTO_TUNE_PULSE_ENABLED ? TFT_GREEN : TFT_ORANGE);
+  row("kWetEst", pm ? String(pm->kWetEst, 3) : "-", TFT_CYAN);
+  row("lastPulseSec", String(lastComputedPulseSec, 1), TFT_CYAN);
+  row("irrState", String((int)irrState), TFT_CYAN);
+  row("pulseCycle", String(pulseCycleCount) + "/" + String(MAX_PULSE_CYCLES_PER_CALL), TFT_CYAN);
 }
 
 // --------------------- Setup ---------------------
