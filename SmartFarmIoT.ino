@@ -31,6 +31,8 @@ const int WATER_VALUE = 970;    // เปียก
 const uint8_t CH_MIN = 1;
 const uint8_t CH_MAX = 13;
 
+const uint8_t ESPNOW_CHANNEL = 9;   // ต้องตรง Node B
+
 volatile bool ackReceived = false;
 volatile uint32_t ackSeqRx = 0;
 volatile unsigned long lastAckMs = 0;
@@ -388,6 +390,11 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
 
+  setWifiChannel(ESPNOW_CHANNEL);
+  Serial.printf("[CH] fixed at %u\n", ESPNOW_CHANNEL);
+  channelLocked = true;
+  lastAckMs = millis();
+
   // ล็อก channel ให้ตรงกับ Node B (สำคัญ)
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_promiscuous(false);
@@ -398,21 +405,10 @@ void setup() {
   if (!initEspNowTx()) {
     Serial.println("ESP-NOW TX init error");
   }
-
-  setWifiChannel(1);
-  scanAndLockChannel();
-  if (scanAndLockChannel()) {
-    if (!probeChannelOnce(currentChannel, 120)) {
-      channelLocked = false;
-      Serial.println("[CH] verify failed -> unlock");
-    }
-  }
-
   Serial.println("Node A Ready");
 }
 
 void loop() {
-  maintainChannelLock();
 
   // ยังไม่ lock channel อย่าส่ง soil/lux
   if (!channelLocked) {
