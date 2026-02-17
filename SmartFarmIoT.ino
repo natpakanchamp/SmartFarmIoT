@@ -37,10 +37,6 @@
 #define SDA 21
 #define SCL 22
 
-// --------------------- Soil Calibration ---------------------
-const int AIR_VALUE = 2730;    // ค่าแห้ง (ต้องคาลิเบรตตามของจริง)
-const int WATER_VALUE = 970;   // ค่าเปียก (ต้องคาลิเบรตตามของจริง)
-
 // --------------------- Safety / Limits ---------------------
 const int SOIL_CRITICAL = 20;          // ต่ำมาก -> emergency watering
 const int LUX_SAFE_LIMIT = 30000;      // fallback lux threshold
@@ -82,8 +78,6 @@ float lastLuxForTelemetry = 0.0f;
 bool hasLastLuxForTelemetry = false;
 
 // --------------------- Soil robust filtering ---------------------
-float soilSmoothedPct = 0.0f;
-const float soilAlpha = 0.18f;
 const unsigned long SOIL_IGNORE_AFTER_VALVE_ON_MS = 15000UL;  // ignore decision after valve ON
 
 // --------------------- Dry-back controls ---------------------
@@ -104,9 +98,7 @@ int soilPercent = 0;
 
 struct RemoteSoilSnapshot {
   bool has;
-  int pct;
   uint32_t seq;
-  uint8_t ok;
   unsigned long rxMs;
 };
 
@@ -132,14 +124,16 @@ enum MsgType : uint8_t {
   MSG_LUX  = 2
 };
 
+#define SOIL_COUNT 4
+
 typedef struct __attribute__((packed)) {
   uint8_t  msgType;
   uint32_t seq;
-  int16_t  soilPct;     // 0..100
-  uint16_t soilRaw;     // raw ADC from node A (optional for debug)
+  int16_t  soilPct[SOIL_COUNT];   // 4 จุด
+  uint16_t soilRaw[SOIL_COUNT];   // 4 จุด (debug)
+  uint8_t  sensorOkMask;          // bit0..bit3
   uint32_t uptimeMs;
-  uint8_t  sensorOk;    // 1=ok, 0=fault
-} SoilPacket; // รับมาจาก Node A
+} SoilPacket;
 
 typedef struct __attribute__((packed)) {
   uint8_t  msgType;
@@ -150,10 +144,15 @@ typedef struct __attribute__((packed)) {
 } LuxPacket; // รับมาจาก Node A
 
 volatile bool hasRemoteSoil = false;
-volatile int remoteSoilPct = 0;
+volatile int remoteSoilPct[SOIL_COUNT] = {0,0,0,0};
+volatile uint8_t remoteSoilOkMask = 0;
 volatile uint32_t remoteSeq = 0;
-volatile uint8_t remoteSensorOk = 0;
 volatile unsigned long lastSoilRxMs = 0;
+
+// ค่า aggregate ที่ใช้ control (นิ่งขึ้น)
+float soilAggEma = 0.0f;
+bool soilAggEmaInit = false;
+const float SOIL_AGG_ALPHA = 0.25f;
 
 const unsigned long SOIL_RX_TIMEOUT_MS = 15000UL;   // ถ้าเกินนี้ถือว่าลิงก์หาย
 
@@ -794,34 +793,83 @@ RemoteSoilSnapshot getRemoteSoilSnapshot() {
   RemoteSoilSnapshot s;
   noInterrupts();
   s.has = hasRemoteSoil;
-  s.pct = remoteSoilPct;
   s.seq = remoteSeq;
-  s.ok = remoteSensorOk;
   s.rxMs = lastSoilRxMs;
   interrupts();
   return s;
 }
 
-// --------------------- Helper Soil for Control --------------
-int getSoilPercentForControl() {
-  RemoteSoilSnapshot s = getRemoteSoilSnapshot();
+// -------------------------- AggregateSoilFrom4 ---------------------------------
+int aggregateSoilFrom4(const int v[SOIL_COUNT], uint8_t okMask, bool &enoughValid) {
+  int a[SOIL_COUNT];
+  int n = 0;
 
-  if (s.has) {
-    unsigned long age = millis() - s.rxMs;
-    if (age <= SOIL_RX_TIMEOUT_MS && s.ok == 1) {
-      return constrain(s.pct, 0, 100);
+  for (int i = 0; i < SOIL_COUNT; i++) {
+    if (okMask & (1 << i)) {
+      int x = constrain(v[i], 0, 100);
+      a[n++] = x;
     }
   }
-  return 100;
+
+  if (n < 2) {
+    enoughValid = false;
+    return 100; // fail-safe
+  }
+
+  enoughValid = true;
+
+  // sort
+  for (int i = 1; i < n; i++) {
+    int key = a[i], j = i - 1;
+    while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = key;
+  }
+
+  if (n >= 4) return (int)roundf((a[1] + a[2]) / 2.0f); // trimmed mean
+  if (n == 3) return a[1];                               // median
+  return (int)roundf((a[0] + a[1]) / 2.0f);              // average of 2
+}
+
+// --------------------- Helper Soil for Control --------------
+int getSoilPercentForControl() {
+  if (!hasRemoteSoil) return 100;
+  if ((millis() - lastSoilRxMs) > SOIL_RX_TIMEOUT_MS) return 100;
+
+  int tmp[SOIL_COUNT];
+  uint8_t okMask;
+  noInterrupts();
+  for (int i = 0; i < SOIL_COUNT; i++) tmp[i] = remoteSoilPct[i];
+  okMask = remoteSoilOkMask;
+  interrupts();
+
+  bool enough = false;
+  int agg = aggregateSoilFrom4(tmp, okMask, enough);
+  if (!enough) return 100;
+
+  // EMA รวมอีกชั้นให้ controller นิ่ง
+  if (!soilAggEmaInit) {
+    soilAggEma = (float)agg;
+    soilAggEmaInit = true;
+  } else {
+    soilAggEma = SOIL_AGG_ALPHA * agg + (1.0f - SOIL_AGG_ALPHA) * soilAggEma;
+  }
+
+  return constrain((int)roundf(soilAggEma), 0, 100);
 }
 
 bool isRemoteSoilHealthy() {
-  RemoteSoilSnapshot s = getRemoteSoilSnapshot();
+  if (!hasRemoteSoil) return false;
+  if ((millis() - lastSoilRxMs) > SOIL_RX_TIMEOUT_MS) return false;
 
-  if (!s.has) return false;
-  if ((millis() - s.rxMs) > SOIL_RX_TIMEOUT_MS) return false;
-  if (s.ok != 1) return false;
-  return true;
+  uint8_t m;
+  noInterrupts();
+  m = remoteSoilOkMask;
+  interrupts();
+
+  // ต้องมี sensor ใช้งานได้อย่างน้อย 2 ตัว
+  int cnt = 0;
+  for (int i = 0; i < SOIL_COUNT; i++) if (m & (1 << i)) cnt++;
+  return (cnt >= 2);
 }
 
 bool isRemoteLuxHealthy() {
@@ -1201,7 +1249,12 @@ void calculate(int currentHour, int currentMin) {
     Serial.print(" | lastPulseSec: "); Serial.println(lastComputedPulseSec, 2);
     RemoteSoilSnapshot s = getRemoteSoilSnapshot();
     Serial.print("RemoteSoilHealthy: "); Serial.println(isRemoteSoilHealthy() ? "YES" : "NO");
-    Serial.print("RemoteSoilPct: "); Serial.println(s.pct);
+    int p0,p1,p2,p3; uint8_t mk;
+    noInterrupts();
+    p0=remoteSoilPct[0]; p1=remoteSoilPct[1]; p2=remoteSoilPct[2]; p3=remoteSoilPct[3];
+    mk=remoteSoilOkMask;
+    interrupts();
+    Serial.printf("RemoteSoil4: [%d,%d,%d,%d] mask=0x%02X\n", p0,p1,p2,p3,mk);
     Serial.print("RemoteSeq: "); Serial.println((unsigned long)s.seq);
     Serial.print("SoilRxAgeMs: ");
     if (!s.has) Serial.println(-1);
@@ -1245,21 +1298,29 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 
   // ---------- SoilPacket ----------
   if (type == MSG_SOIL && len == (int)sizeof(SoilPacket)) {
-    SoilPacket pkt;
-    memcpy(&pkt, data, sizeof(pkt));
+  SoilPacket pkt;
+  memcpy(&pkt, data, sizeof(pkt));
 
-    if (pkt.soilPct < 0 || pkt.soilPct > 100) return;
-
-    remoteSoilPct = pkt.soilPct;
-    remoteSeq = pkt.seq;
-    remoteSensorOk = pkt.sensorOk;
-    hasRemoteSoil = true;
-    lastSoilRxMs = millis();
-
-    Serial.printf("[RX SOIL] seq=%lu pct=%d ok=%u\n",
-                  (unsigned long)pkt.seq, (int)pkt.soilPct, (unsigned)pkt.sensorOk);
-    return;
+  // sanitize
+  for (int i = 0; i < SOIL_COUNT; i++) {
+    if (pkt.soilPct[i] < 0) pkt.soilPct[i] = 0;
+    if (pkt.soilPct[i] > 100) pkt.soilPct[i] = 100;
   }
+
+  noInterrupts();
+  for (int i = 0; i < SOIL_COUNT; i++) remoteSoilPct[i] = pkt.soilPct[i];
+  remoteSoilOkMask = pkt.sensorOkMask;
+  remoteSeq = pkt.seq;
+  hasRemoteSoil = true;
+  lastSoilRxMs = millis();
+  interrupts();
+
+  Serial.printf("[RX SOIL] seq=%lu p=[%d,%d,%d,%d] mask=0x%02X\n",
+                (unsigned long)pkt.seq,
+                pkt.soilPct[0], pkt.soilPct[1], pkt.soilPct[2], pkt.soilPct[3],
+                pkt.sensorOkMask);
+  return;
+}
 
   // ---- LuxPacket ----
   if (type == MSG_LUX && len == (int)sizeof(LuxPacket)) {
@@ -1270,11 +1331,13 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
                  !isnan(lp.lux) && !isinf(lp.lux) &&
                  (lp.lux >= LUX_MIN_VALID) && (lp.lux <= LUX_MAX_VALID);
 
+    noInterrupts();
     remoteLux = lp.lux;
     remoteLuxSeq = lp.seq;
     remoteLuxOk = luxOk ? 1 : 0;
     hasRemoteLux = true;
     lastLuxRxMs = millis();
+    interrupts();
     Serial.printf("[RX LUX ] seq=%lu lux=%.2f ok=%u\n",
                   (unsigned long)lp.seq, lp.lux, (unsigned)remoteLuxOk);
     return;
@@ -1418,7 +1481,13 @@ void drawPageHealth() {
 
   row("Soil Link", isRemoteSoilHealthy() ? "OK" : "TIMEOUT", colorByBool(isRemoteSoilHealthy()));
   row("Soil Rx Age", String(soilAge) + " ms", (soilAge <= SOIL_RX_TIMEOUT_MS) ? TFT_GREEN : TFT_RED);
-  row("Soil SensorOK", String(remoteSensorOk), colorByBool(remoteSensorOk == 1));
+  uint8_t m;
+  noInterrupts();
+  m = remoteSoilOkMask;
+  interrupts();
+  int validCnt = 0;
+  for (int i=0;i<SOIL_COUNT;i++) if (m & (1<<i)) validCnt++;
+  row("Soil ValidCnt", String(validCnt) + "/4", colorByBool(validCnt >= 2));
 
   row("Lux Link", isRemoteLuxHealthy() ? "OK" : "TIMEOUT", colorByBool(isRemoteLuxHealthy()));
   row("Lux Rx Age", String(luxAge) + " ms", (luxAge <= LUX_RX_TIMEOUT_MS) ? TFT_GREEN : TFT_RED);
