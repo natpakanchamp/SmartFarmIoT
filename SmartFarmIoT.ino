@@ -644,7 +644,7 @@ float readLuxSafe() {
       bhReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
       if (bhReady) {
         Serial.println("[BH1750] Recovered");
-        luxSmoothed = 0.0f;
+        luxSmoothed = 0.0f; 
         isLuxValid = false;
         lastValidLux = 0.0f;
         lastValidLuxMs = 0;
