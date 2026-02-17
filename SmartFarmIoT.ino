@@ -1326,6 +1326,10 @@ bool isSameMac(const uint8_t* a, const uint8_t* b) {
 
 // -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  Serial.printf("[RX ANY] from %02X:%02X:%02X:%02X:%02X:%02X len=%d type=%u\n",
+  info->src_addr[0], info->src_addr[1], info->src_addr[2],
+  info->src_addr[3], info->src_addr[4], info->src_addr[5],
+  len, data[0]);
   if (!info || !data || len < 1) return;
   if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return; // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
 
