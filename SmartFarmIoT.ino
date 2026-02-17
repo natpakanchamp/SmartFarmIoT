@@ -33,12 +33,12 @@ const uint8_t CH_MAX = 13;
 
 volatile bool ackReceived = false;
 volatile uint32_t ackSeqRx = 0;
+volatile unsigned long lastAckMs = 0;
 
 bool channelLocked = false;
 uint8_t currentChannel = 1;
 uint32_t pingSeq = 0;
 
-unsigned long lastAckMs = 0;
 const unsigned long LINK_LOST_MS = 8000UL;   // ถ้าเกินนี้ถือว่าลิงก์หาย
 
 float soilEma[SOIL_COUNT] = {0,0,0,0};
@@ -306,6 +306,7 @@ bool scanAndLockChannel() {
       Serial.printf("[CH] locked at %u\n", ch);
       return true;
     }
+    delay(1);
   }
 
   // รอบสองเผื่อจังหวะหลุด
@@ -316,6 +317,7 @@ bool scanAndLockChannel() {
       Serial.printf("[CH] locked(retry) at %u\n", ch);
       return true;
     }
+    delay(1);
   }
   
   channelLocked = false;
@@ -327,23 +329,22 @@ void maintainChannelLock() {
   static unsigned long lastPingKeepAliveMs = 0;
   unsigned long now = millis();
 
-  // ถ้ายังไม่ล็อก -> พยายามหาเลย
   if (!channelLocked) {
     scanAndLockChannel();
     return;
   }
 
-  // keep-alive ทุก 2 วินาทีด้วย ping
   if (now - lastPingKeepAliveMs >= 2000UL) {
     lastPingKeepAliveMs = now;
-    if (!probeChannelOnce(currentChannel, 80)) {
-      lastAckMs = millis();
-      // ไม่ตอบครั้งเดียวไม่ฟันธง รอ timeout จริง
-    }
+    (void)probeChannelOnce(currentChannel, 80);
   }
 
-  // timeout -> ปลดล็อกแล้วสแกนใหม่
-  if (now - lastAckMs > LINK_LOST_MS) {
+  unsigned long ackMsSnapshot;
+  noInterrupts();
+  ackMsSnapshot = lastAckMs;
+  interrupts();
+
+  if (now - ackMsSnapshot > LINK_LOST_MS) {
     Serial.println("[CH] link lost -> re-scan");
     channelLocked = false;
   }
@@ -400,6 +401,12 @@ void setup() {
 
   setWifiChannel(1);
   scanAndLockChannel();
+  if (scanAndLockChannel()) {
+    if (!probeChannelOnce(currentChannel, 120)) {
+      channelLocked = false;
+      Serial.println("[CH] verify failed -> unlock");
+    }
+  }
 
   Serial.println("Node A Ready");
 }
