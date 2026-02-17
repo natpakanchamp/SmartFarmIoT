@@ -896,7 +896,7 @@ float getLuxForControlAndDLI() {
     return lx;
   }
   // fallback ไป local BH1750 ของ Node B
-  return NAN;
+  return readLuxSafe();
 }
 
 // --------------------- Water control ---------------------
