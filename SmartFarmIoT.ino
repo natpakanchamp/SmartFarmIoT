@@ -236,8 +236,11 @@ const char* KEY_KWET_P2 = "kWetP2";
 const char* KEY_KWET_P3 = "kWetP3";
 
 // --------------------- WiFi ---------------------
-const char* ssid_3 = "JebHuaJai";
-const char* pass_3 = "ffffffff";
+// const char* ssid_3 = "JebHuaJai";
+// const char* pass_3 = "ffffffff";
+
+const char* ssid_3 = "CPE-9634";
+const char* pass_3 = "9876543210";
 
 // --------------------- MQTT ---------------------
 const char* mqtt_broker = "broker.emqx.io";
