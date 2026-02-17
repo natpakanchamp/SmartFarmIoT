@@ -219,7 +219,7 @@ bool initEspNowTx() {
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, NODE_B_MAC, 6);
-  peerInfo.channel = 0;   // dynamic: ใช้ current channel ของ STA
+  peerInfo.channel = 9;   // dynamic: ใช้ current channel ของ STA
   peerInfo.encrypt = false;
 
   if (esp_now_is_peer_exist(NODE_B_MAC)) {
@@ -397,6 +397,7 @@ void setup() {
 
   // ล็อก channel ให้ตรงกับ Node B (สำคัญ)
   esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   Serial.print("[WiFi] STA MAC: ");
