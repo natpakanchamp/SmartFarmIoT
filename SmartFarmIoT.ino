@@ -122,8 +122,6 @@ static const char* TZ_INFO = "<+07>-7";   // UTC+7
 enum MsgType : uint8_t {
   MSG_SOIL = 1,
   MSG_LUX  = 2,
-  MSG_PING = 3,
-  MSG_ACK  = 4
 };
 
 // ================= ESP-NOW fixed channel config =================
@@ -183,8 +181,8 @@ volatile unsigned long lastLuxRxMs = 0;
 const unsigned long LUX_RX_TIMEOUT_MS = 15000UL;
 
 // 1C:C3:AB:B4:77:CC
-const uint8_t ALLOWED_SENDER_MAC[6] = {0x1C, 0xC3, 0xAB, 0xB4, 0x77, 0xCC}; // แก้เป็น MAC ของ Node A จริง
-bool isSameMac(const uint8_t* a, const uint8_t* b);
+//const uint8_t ALLOWED_SENDER_MAC[6] = {0x1C, 0xC3, 0xAB, 0xB4, 0x77, 0xCC}; // แก้เป็น MAC ของ Node A จริง
+//bool isSameMac(const uint8_t* a, const uint8_t* b);
 
 // --------------------- Runtime timers ---------------------
 unsigned long lastNetworkCheck = 0;
@@ -328,32 +326,6 @@ const char* phaseText(GrowPhase p) {
 
 // วันเริ่มปลูก (local epoch)
 time_t transplantEpoch = 0;
-
-void sendAckToNodeA(const uint8_t* dstMac, uint32_t seq) {
-  AckPacket ack{};
-  ack.msgType = MSG_ACK;
-  ack.seq = seq;
-  ack.uptimeMs = millis();
-
-  esp_now_peer_info_t peer{};
-  memcpy(peer.peer_addr, dstMac, 6);
-  peer.channel = ESPNOW_CHANNEL;
-  peer.encrypt = false;
-  peer.ifidx = WIFI_IF_STA;   // << เพิ่ม
-
-  if (!esp_now_is_peer_exist(dstMac)) {
-    esp_err_t a = esp_now_add_peer(&peer);
-    if (a != ESP_OK) {
-      Serial.printf("[ACK] add peer fail err=%d\n", (int)a);
-      return;
-    }
-  }
-
-  esp_err_t s = esp_now_send(dstMac, (uint8_t*)&ack, sizeof(ack));
-  if (s != ESP_OK) {
-    Serial.printf("[ACK] send fail err=%d\n", (int)s);
-  }
-}
 
 void lockEspNowChannelToFixed() {
   esp_wifi_set_promiscuous(true);
@@ -1343,6 +1315,22 @@ void printTimeDebugBoth() {
     tmLoc.tm_hour, tmLoc.tm_min, tmLoc.tm_sec);
 }
 
+bool initEspNowReceiver() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] init failed");
+    return false;
+  }
+
+  if (esp_now_register_recv_cb(onEspNowRecv) != ESP_OK) {
+    Serial.println("[ESP-NOW] register recv cb failed");
+    return false;
+  }
+
+  Serial.printf("[ESP-NOW] Receiver ready | SoilPacket=%u LuxPacket=%u\n",
+                (unsigned)sizeof(SoilPacket), (unsigned)sizeof(LuxPacket));
+  return true;
+}
+
 // ------------------ Compare MAC Address Node A ------------------------
 bool isSameMac(const uint8_t* a, const uint8_t* b) {
   for (int i = 0; i < 6; i++) {
@@ -1354,58 +1342,47 @@ bool isSameMac(const uint8_t* a, const uint8_t* b) {
 // -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!info || !data || len < 1) return;
-  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) {
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 2000) {
-      lastPrint = millis();
-      Serial.print("[ESP-NOW] drop unknown MAC: ");
-      Serial.println(macToString(info->src_addr));
-    }
-    return;
-  }
 
   uint8_t type = data[0];
 
-  if (type == MSG_PING && len == (int)sizeof(PingPacket)) {
-    PingPacket p{};
-    memcpy(&p, data, sizeof(p));
-
-    // ตอบกลับเฉพาะ sender ที่อนุญาต
-    if (isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) {
-      sendAckToNodeA(info->src_addr, p.seq);
-      Serial.printf("[PING] rx seq=%lu -> ACK\n", (unsigned long)p.seq);
+  // ---------- SOIL ----------
+  if (type == MSG_SOIL) {
+    if (len != (int)sizeof(SoilPacket)) {
+      Serial.printf("[RX SOIL] bad len=%d expect=%u\n", len, (unsigned)sizeof(SoilPacket));
+      return;
     }
+
+    SoilPacket pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+
+    for (int i = 0; i < SOIL_COUNT; i++) {
+      if (pkt.soilPct[i] < 0) pkt.soilPct[i] = 0;
+      if (pkt.soilPct[i] > 100) pkt.soilPct[i] = 100;
+    }
+
+    noInterrupts();
+    for (int i = 0; i < SOIL_COUNT; i++) remoteSoilPct[i] = pkt.soilPct[i];
+    remoteSoilOkMask = pkt.sensorOkMask;
+    remoteSeq = pkt.seq;
+    hasRemoteSoil = true;
+    lastSoilRxMs = millis();
+    interrupts();
+
+    Serial.printf("[RX SOIL] from=%s seq=%lu p=[%d,%d,%d,%d] mask=0x%02X\n",
+      macToString(info->src_addr).c_str(),
+      (unsigned long)pkt.seq,
+      pkt.soilPct[0], pkt.soilPct[1], pkt.soilPct[2], pkt.soilPct[3],
+      pkt.sensorOkMask);
     return;
   }
 
-  // ---------- SoilPacket ----------
-  if (type == MSG_SOIL && len == (int)sizeof(SoilPacket)) {
-  SoilPacket pkt;
-  memcpy(&pkt, data, sizeof(pkt));
+  // ---------- LUX (BH1750) ----------
+  if (type == MSG_LUX) {
+    if (len != (int)sizeof(LuxPacket)) {
+      Serial.printf("[RX LUX ] bad len=%d expect=%u\n", len, (unsigned)sizeof(LuxPacket));
+      return;
+    }
 
-  // sanitize
-  for (int i = 0; i < SOIL_COUNT; i++) {
-    if (pkt.soilPct[i] < 0) pkt.soilPct[i] = 0;
-    if (pkt.soilPct[i] > 100) pkt.soilPct[i] = 100;
-  }
-
-  noInterrupts();
-  for (int i = 0; i < SOIL_COUNT; i++) remoteSoilPct[i] = pkt.soilPct[i];
-  remoteSoilOkMask = pkt.sensorOkMask;
-  remoteSeq = pkt.seq;
-  hasRemoteSoil = true;
-  lastSoilRxMs = millis();
-  interrupts();
-
-  Serial.printf("[RX SOIL] seq=%lu p=[%d,%d,%d,%d] mask=0x%02X\n",
-                (unsigned long)pkt.seq,
-                pkt.soilPct[0], pkt.soilPct[1], pkt.soilPct[2], pkt.soilPct[3],
-                pkt.sensorOkMask);
-  return;
-}
-
-  // ---- LuxPacket ----
-  if (type == MSG_LUX && len == (int)sizeof(LuxPacket)) {
     LuxPacket lp;
     memcpy(&lp, data, sizeof(lp));
 
@@ -1420,28 +1397,15 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     hasRemoteLux = true;
     lastLuxRxMs = millis();
     interrupts();
-    Serial.printf("[RX LUX ] seq=%lu lux=%.2f ok=%u\n",
-                  (unsigned long)lp.seq, lp.lux, (unsigned)remoteLuxOk);
+
+    Serial.printf("[RX LUX ] from=%s seq=%lu lux=%.2f ok=%u\n",
+      macToString(info->src_addr).c_str(),
+      (unsigned long)lp.seq, lp.lux, (unsigned)remoteLuxOk);
     return;
   }
-  Serial.printf("[ESP-NOW] Unknown packet type=%u len=%d\n", (unsigned)type, len);
-}
 
-
-// init ESP-NOW receiver on Control Unit (Node B)
-bool initEspNowReceiver() {
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("[ESP-NOW] init failed");
-    return false;
-  }
-
-  if (esp_now_register_recv_cb(onEspNowRecv) != ESP_OK) {
-    Serial.println("[ESP-NOW] register recv cb failed");
-    return false;
-  }
-
-  Serial.println("[ESP-NOW] Receiver ready");
-  return true;
+  // ignore อื่น ๆ
+  Serial.printf("[ESP-NOW] unknown type=%u len=%d\n", (unsigned)type, len);
 }
 
 void drawHeader(int h, int m) {
