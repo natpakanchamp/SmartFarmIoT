@@ -21,14 +21,22 @@
 #define SDA 21
 #define SCL 22
 
+const int SOIL_PINS[SOIL_COUNT] = {34, 35, 32, 33};
+
 // --------------------- Soil Calibration ---------------------
 // ปรับตามการคาลิเบรตจริงของเซนเซอร์คุณ
 const int AIR_VALUE   = 2730;   // แห้ง
 const int WATER_VALUE = 970;    // เปียก
-const int SOIL_PINS[SOIL_COUNT] = {34, 35, 32, 33};
 
 float soilEma[SOIL_COUNT] = {0,0,0,0};
 bool  soilEmaInit[SOIL_COUNT] = {false,false,false,false};
+const float SOIL_ALPHA = 0.18f;
+
+// --------------------- BH1750 ---------------------
+BH1750 lightMeter;
+bool bhReady = false;
+unsigned long lastBhRetryMs = 0;
+const unsigned long BH_RETRY_INTERVAL = 3000UL;
 
 struct __attribute__((packed)) Soil4Packet {
   uint8_t  msgType;         // MSG_SOIL
@@ -41,7 +49,6 @@ struct __attribute__((packed)) Soil4Packet {
 
 // --------------------- Soil Filter ---------------------
 float soilSmoothedPct = 0.0f;
-const float SOIL_ALPHA = 0.18f;
 
 bool isRawSoilFault(int raw) {
   return (raw > 3500 || raw < 100);
@@ -67,12 +74,14 @@ int rawToPercent(int raw) {
   return p;
 }
 
-int getSoilPercentRobust(uint16_t &rawOut, bool &sensorOkOut) {
-  int r1 = analogRead(SOIL_PIN);
-  int r2 = analogRead(SOIL_PIN);
-  int r3 = analogRead(SOIL_PIN);
-  int r4 = analogRead(SOIL_PIN);
-  int r5 = analogRead(SOIL_PIN);
+int getSoilPercentRobustAt(uint8_t idx, uint16_t &rawOut, bool &sensorOkOut) {
+  const int pin = SOIL_PINS[idx];
+
+  int r1 = analogRead(pin);
+  int r2 = analogRead(pin);
+  int r3 = analogRead(pin);
+  int r4 = analogRead(pin);
+  int r5 = analogRead(pin);
 
   int raw = median5(r1, r2, r3, r4, r5);
   rawOut = (uint16_t)raw;
@@ -85,20 +94,18 @@ int getSoilPercentRobust(uint16_t &rawOut, bool &sensorOkOut) {
   sensorOkOut = true;
   int p = rawToPercent(raw);
 
-  if (soilSmoothedPct <= 0.01f) soilSmoothedPct = (float)p;
-  soilSmoothedPct = SOIL_ALPHA * p + (1.0f - SOIL_ALPHA) * soilSmoothedPct;
+  if (!soilEmaInit[idx]) {
+    soilEma[idx] = (float)p;
+    soilEmaInit[idx] = true;
+  } else {
+    soilEma[idx] = SOIL_ALPHA * p + (1.0f - SOIL_ALPHA) * soilEma[idx];
+  }
 
-  int out = (int)roundf(soilSmoothedPct);
+  int out = (int)roundf(soilEma[idx]);
   if (out < 0) out = 0;
   if (out > 100) out = 100;
   return out;
 }
-
-// --------------------- BH1750 ---------------------
-BH1750 lightMeter;
-bool bhReady = false;
-unsigned long lastBhRetryMs = 0;
-const unsigned long BH_RETRY_INTERVAL = 3000UL;
 
 float readLuxSafe(bool &ok) {
   unsigned long now = millis();
@@ -129,15 +136,6 @@ enum MsgType : uint8_t {
   MSG_SOIL = 1,
   MSG_LUX  = 2
 };
-// ต้องตรงกับ Node B
-typedef struct __attribute__((packed)) {
-  uint8_t  msgType;
-  uint32_t seq;
-  int16_t  soilPct;     // 0..100
-  uint16_t soilRaw;     // raw ADC
-  uint32_t uptimeMs;
-  uint8_t  sensorOk;    // 1=ok, 0=fault
-} SoilPacket;
 
 // (เสริม) packet แสง แยกอีกตัว หากอนาคต Node B อยากรับด้วย
 typedef struct __attribute__((packed)) {
@@ -198,25 +196,33 @@ bool initEspNowTx() {
 }
 
 void sendSoilPacket() {
-  uint16_t raw = 0;
-  bool soilOk = false;
-  int soilPct = getSoilPercentRobust(raw, soilOk);
-
-  SoilPacket pkt;
-  pkt.seq = ++soilSeq;
-  pkt.soilPct = (int16_t)soilPct;
-  pkt.soilRaw = raw;
-  pkt.uptimeMs = millis();
-  pkt.sensorOk = soilOk ? 1 : 0;
+  Soil4Packet pkt{};
   pkt.msgType = MSG_SOIL;
+  pkt.seq = ++soilSeq;
+  pkt.uptimeMs = millis();
+  pkt.sensorOkMask = 0;
+
+  for (uint8_t i = 0; i < SOIL_COUNT; i++) {
+    uint16_t raw = 0;
+    bool ok = false;
+    int pct = getSoilPercentRobustAt(i, raw, ok);
+
+    pkt.soilPct[i] = (int16_t)pct;
+    pkt.soilRaw[i] = raw;
+
+    if (ok) pkt.sensorOkMask |= (1 << i);
+  }
 
   esp_err_t r = esp_now_send(NODE_B_MAC, (uint8_t*)&pkt, sizeof(pkt));
   if (r != ESP_OK) {
-    Serial.printf("[ESP-NOW] Soil send err=%d\n", (int)r);
+    Serial.printf("[ESP-NOW] Soil4 send err=%d\n", (int)r);
   }
 
-  Serial.printf("[SOIL] seq=%lu raw=%u pct=%d ok=%d\n",
-                (unsigned long)pkt.seq, pkt.soilRaw, pkt.soilPct, pkt.sensorOk);
+  Serial.printf("[SOIL] seq=%lu pct=[%d,%d,%d,%d] raw=[%u,%u,%u,%u] mask=0x%02X\n",
+                (unsigned long)pkt.seq,
+                pkt.soilPct[0], pkt.soilPct[1], pkt.soilPct[2], pkt.soilPct[3],
+                pkt.soilRaw[0], pkt.soilRaw[1], pkt.soilRaw[2], pkt.soilRaw[3],
+                pkt.sensorOkMask);
 }
 
 void sendLuxPacket() {
@@ -247,7 +253,9 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  pinMode(SOIL_PIN, INPUT);
+  for (uint8_t i = 0; i < SOIL_COUNT; i++) {
+    pinMode(SOIL_PINS[i], INPUT);
+  }
 
   Wire.begin(SDA, SCL);
   bhReady = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
