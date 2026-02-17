@@ -126,6 +126,10 @@ enum MsgType : uint8_t {
   MSG_ACK  = 4
 };
 
+// ================= ESP-NOW fixed channel config =================
+const uint8_t ESPNOW_CHANNEL = 9;   // << ตั้งให้ตรง Node A และ WiFi AP
+// ===============================================================
+
 #define SOIL_COUNT 4
 
 typedef struct __attribute__((packed)) {
@@ -333,14 +337,29 @@ void sendAckToNodeA(const uint8_t* dstMac, uint32_t seq) {
 
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, dstMac, 6);
-  peer.channel = 0;      // ใช้ current channel
+  peer.channel = ESPNOW_CHANNEL;
   peer.encrypt = false;
+  peer.ifidx = WIFI_IF_STA;   // << เพิ่ม
 
   if (!esp_now_is_peer_exist(dstMac)) {
-    esp_now_add_peer(&peer);
+    esp_err_t a = esp_now_add_peer(&peer);
+    if (a != ESP_OK) {
+      Serial.printf("[ACK] add peer fail err=%d\n", (int)a);
+      return;
+    }
   }
 
-  esp_now_send(dstMac, (uint8_t*)&ack, sizeof(ack));
+  esp_err_t s = esp_now_send(dstMac, (uint8_t*)&ack, sizeof(ack));
+  if (s != ESP_OK) {
+    Serial.printf("[ACK] send fail err=%d\n", (int)s);
+  }
+}
+
+void lockEspNowChannelToFixed() {
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  Serial.printf("[ESP-NOW] forced channel=%u\n", ESPNOW_CHANNEL);
 }
 
 // --------------------- Interrupt ---------------------
@@ -558,6 +577,13 @@ void timezoneSync() {
   printTimeDebugBoth();
 }
 
+String macToString(const uint8_t* mac) {
+  char s[18];
+  snprintf(s, sizeof(s), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(s);
+}
+
 // --------------------- Network handler ---------------------
 void handleNetwork() {
   bool isWifiConnected = (wifiMulti.run() == WL_CONNECTED);
@@ -567,6 +593,7 @@ void handleNetwork() {
     delay(1200);
     timezoneSync();
     struct tm ti;
+    lockEspNowChannelToFixed();
     if (getLocalTimeSafe(&ti)) {
       updateDisplay_Buffered(ti.tm_hour, ti.tm_min);
     }
@@ -1326,12 +1353,16 @@ bool isSameMac(const uint8_t* a, const uint8_t* b) {
 
 // -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  Serial.printf("[RX ANY] from %02X:%02X:%02X:%02X:%02X:%02X len=%d type=%u\n",
-  info->src_addr[0], info->src_addr[1], info->src_addr[2],
-  info->src_addr[3], info->src_addr[4], info->src_addr[5],
-  len, data[0]);
   if (!info || !data || len < 1) return;
-  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return; // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
+  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) {
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 2000) {
+      lastPrint = millis();
+      Serial.print("[ESP-NOW] drop unknown MAC: ");
+      Serial.println(macToString(info->src_addr));
+    }
+    return;
+  }
 
   uint8_t type = data[0];
 
@@ -1654,11 +1685,6 @@ void setup() {
   client.setServer(mqtt_broker, mqtt_port);
   client.setCallback(callback);
 
-  // Init ESP-NOW receiver (Node B)
-  if (!initEspNowReceiver()) {
-    Serial.println("[ESP-NOW] Receiver init error");
-  }
-
   // WiFi
   wifiMulti.addAP(ssid_3, pass_3);
 
@@ -1674,6 +1700,18 @@ void setup() {
     delay(500);
   }
   Serial.println();
+
+  if (wifiMulti.run() == WL_CONNECTED) {
+    lockEspNowChannelToFixed();
+    Serial.printf("[WiFi] channel=%d\n", WiFi.channel());
+  } else {
+    Serial.println("[WiFi] connect timeout, ESP-NOW may fail if channel mismatch");
+  }
+
+  // Init ESP-NOW receiver (Node B)
+  if (!initEspNowReceiver()) {
+    Serial.println("[ESP-NOW] Receiver init error");
+  }
 
   tft.fillScreen(TFT_BLACK);
   tft.drawString("SYNCING TIME...", 10, 10, 4);
