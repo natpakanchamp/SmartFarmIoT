@@ -17,7 +17,7 @@
 #include <string.h>
 
 // --------------------- Pin Mapping ---------------------
-#define SOIL_PIN 34
+#define SOIL_COUNT 4
 #define SDA 21
 #define SCL 22
 
@@ -25,6 +25,19 @@
 // ปรับตามการคาลิเบรตจริงของเซนเซอร์คุณ
 const int AIR_VALUE   = 2730;   // แห้ง
 const int WATER_VALUE = 970;    // เปียก
+const int SOIL_PINS[SOIL_COUNT] = {34, 35, 32, 33};
+
+float soilEma[SOIL_COUNT] = {0,0,0,0};
+bool  soilEmaInit[SOIL_COUNT] = {false,false,false,false};
+
+struct __attribute__((packed)) Soil4Packet {
+  uint8_t  msgType;         // MSG_SOIL
+  uint32_t seq;
+  int16_t  soilPct[SOIL_COUNT]; // 0..100 ต่อจุด
+  uint16_t soilRaw[SOIL_COUNT]; // raw ต่อจุด
+  uint8_t  sensorOkMask;    // bit0..bit3 = สถานะแต่ละตัว
+  uint32_t uptimeMs;
+};
 
 // --------------------- Soil Filter ---------------------
 float soilSmoothedPct = 0.0f;
