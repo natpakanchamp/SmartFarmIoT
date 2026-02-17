@@ -121,7 +121,9 @@ static const char* TZ_INFO = "<+07>-7";   // UTC+7
 // --------------------- ESP-NOW (Soil RX from Node A) ---------------------
 enum MsgType : uint8_t {
   MSG_SOIL = 1,
-  MSG_LUX  = 2
+  MSG_LUX  = 2,
+  MSG_PING = 3,
+  MSG_ACK  = 4
 };
 
 #define SOIL_COUNT 4
@@ -142,6 +144,18 @@ typedef struct __attribute__((packed)) {
   uint32_t uptimeMs;
   uint8_t  sensorOk;    // 1=ok, 0=fault
 } LuxPacket; // รับมาจาก Node A
+
+typedef struct __attribute__((packed)) {
+  uint8_t  msgType;   // MSG_PING
+  uint32_t seq;
+  uint32_t uptimeMs;
+} PingPacket;
+
+typedef struct __attribute__((packed)) {
+  uint8_t  msgType;   // MSG_ACK
+  uint32_t seq;       // echo seq จาก ping
+  uint32_t uptimeMs;
+} AckPacket;
 
 volatile bool hasRemoteSoil = false;
 volatile int remoteSoilPct[SOIL_COUNT] = {0,0,0,0};
@@ -310,6 +324,24 @@ const char* phaseText(GrowPhase p) {
 
 // วันเริ่มปลูก (local epoch)
 time_t transplantEpoch = 0;
+
+void sendAckToNodeA(const uint8_t* dstMac, uint32_t seq) {
+  AckPacket ack{};
+  ack.msgType = MSG_ACK;
+  ack.seq = seq;
+  ack.uptimeMs = millis();
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, dstMac, 6);
+  peer.channel = 0;      // ใช้ current channel
+  peer.encrypt = false;
+
+  if (!esp_now_is_peer_exist(dstMac)) {
+    esp_now_add_peer(&peer);
+  }
+
+  esp_now_send(dstMac, (uint8_t*)&ack, sizeof(ack));
+}
 
 // --------------------- Interrupt ---------------------
 void IRAM_ATTR onRTCAlarm() {
@@ -1298,6 +1330,18 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
   if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) return; // รับเฉพาะจาก MAC ของ Node A ที่กำหนดไว้
 
   uint8_t type = data[0];
+
+  if (type == MSG_PING && len == (int)sizeof(PingPacket)) {
+    PingPacket p{};
+    memcpy(&p, data, sizeof(p));
+
+    // ตอบกลับเฉพาะ sender ที่อนุญาต
+    if (isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) {
+      sendAckToNodeA(info->src_addr, p.seq);
+      Serial.printf("[PING] rx seq=%lu -> ACK\n", (unsigned long)p.seq);
+    }
+    return;
+  }
 
   // ---------- SoilPacket ----------
   if (type == MSG_SOIL && len == (int)sizeof(SoilPacket)) {
