@@ -28,6 +28,19 @@ const int SOIL_PINS[SOIL_COUNT] = {34, 35, 32, 33};
 const int AIR_VALUE   = 2730;   // แห้ง
 const int WATER_VALUE = 970;    // เปียก
 
+const uint8_t CH_MIN = 1;
+const uint8_t CH_MAX = 13;
+
+volatile bool ackReceived = false;
+volatile uint32_t ackSeqRx = 0;
+
+bool channelLocked = false;
+uint8_t currentChannel = 1;
+uint32_t pingSeq = 0;
+
+unsigned long lastAckMs = 0;
+const unsigned long LINK_LOST_MS = 8000UL;   // ถ้าเกินนี้ถือว่าลิงก์หาย
+
 float soilEma[SOIL_COUNT] = {0,0,0,0};
 bool  soilEmaInit[SOIL_COUNT] = {false,false,false,false};
 const float SOIL_ALPHA = 0.18f;
@@ -48,7 +61,6 @@ struct __attribute__((packed)) Soil4Packet {
 };
 
 // --------------------- Soil Filter ---------------------
-float soilSmoothedPct = 0.0f;
 
 bool isRawSoilFault(int raw) {
   return (raw > 3500 || raw < 100);
@@ -134,7 +146,9 @@ float readLuxSafe(bool &ok) {
 // --------------------- ESP-NOW Packet ---------------------
 enum MsgType : uint8_t {
   MSG_SOIL = 1,
-  MSG_LUX  = 2
+  MSG_LUX  = 2,
+  MSG_PING = 3,
+  MSG_ACK  = 4
 };
 
 // (เสริม) packet แสง แยกอีกตัว หากอนาคต Node B อยากรับด้วย
@@ -146,12 +160,21 @@ typedef struct __attribute__((packed)) {
   uint8_t  sensorOk;    // 1=ok, 0=fault
 } LuxPacket;
 
+typedef struct __attribute__((packed)) {
+  uint8_t  msgType;   // MSG_PING
+  uint32_t seq;
+  uint32_t uptimeMs;
+} PingPacket;
+
+typedef struct __attribute__((packed)) {
+  uint8_t  msgType;   // MSG_ACK
+  uint32_t seq;
+  uint32_t uptimeMs;
+} AckPacket;
+
 // ใส่ MAC ของ Node B (ตัวรับ) ให้ถูกต้อง
 // ตัวอย่าง: 24:6F:28:AA:BB:CC
 uint8_t NODE_B_MAC[] = {0xD4, 0xE9, 0xF4, 0xC3, 0x30, 0xD4};
-
-// จะใช้อยู่ channel เดียวกับ Node B (WiFi STA)
-const uint8_t ESPNOW_CHANNEL = 9;
 
 // --------------------- Send scheduling ---------------------
 unsigned long lastSoilTxMs = 0;
@@ -161,6 +184,20 @@ const unsigned long LUX_TX_INTERVAL_MS  = 1000UL;   // 1s
 
 uint32_t soilSeq = 0;
 uint32_t luxSeq  = 0;
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (!info || !data || len < 1) return;
+
+  uint8_t type = data[0];
+  if (type == MSG_ACK && len == (int)sizeof(AckPacket)) {
+    AckPacket a{};
+    memcpy(&a, data, sizeof(a));
+    ackSeqRx = a.seq;
+    ackReceived = true;
+    lastAckMs = millis();
+    // Serial.printf("[ACK] seq=%lu\n", (unsigned long)a.seq);
+  }
+}
 
 void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
   (void)tx_info;
@@ -176,10 +213,11 @@ bool initEspNowTx() {
   }
 
   esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, NODE_B_MAC, 6);
-  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.channel = 0;   // dynamic: ใช้ current channel ของ STA
   peerInfo.encrypt = false;
 
   if (esp_now_is_peer_exist(NODE_B_MAC)) {
@@ -193,6 +231,14 @@ bool initEspNowTx() {
 
   Serial.println("[ESP-NOW] TX ready");
   return true;
+}
+
+void setWifiChannel(uint8_t ch) {
+  if (ch < CH_MIN || ch > CH_MAX) return;
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  currentChannel = ch;
 }
 
 void sendSoilPacket() {
@@ -223,6 +269,84 @@ void sendSoilPacket() {
                 pkt.soilPct[0], pkt.soilPct[1], pkt.soilPct[2], pkt.soilPct[3],
                 pkt.soilRaw[0], pkt.soilRaw[1], pkt.soilRaw[2], pkt.soilRaw[3],
                 pkt.sensorOkMask);
+}
+
+bool probeChannelOnce(uint8_t ch, uint16_t waitMs = 90) {
+  setWifiChannel(ch);
+
+  PingPacket p{};
+  p.msgType = MSG_PING;
+  p.seq = ++pingSeq;
+  p.uptimeMs = millis();
+
+  ackReceived = false;
+  ackSeqRx = 0;
+
+  esp_err_t r = esp_now_send(NODE_B_MAC, (uint8_t*)&p, sizeof(p));
+  if (r != ESP_OK) return false;
+
+  unsigned long t0 = millis();
+  while (millis() - t0 < waitMs) {
+    if (ackReceived && ackSeqRx == p.seq) {
+      return true;
+    }
+    delay(2);
+  }
+  return false;
+}
+
+bool scanAndLockChannel() {
+  Serial.println("[CH] scanning...");
+
+  // รอบแรกไล่ 1..13
+  for (uint8_t ch = CH_MIN; ch <= CH_MAX; ch++) {
+    if (probeChannelOnce(ch)) {
+      channelLocked = true;
+      lastAckMs = millis();
+      Serial.printf("[CH] locked at %u\n", ch);
+      return true;
+    }
+  }
+
+  // รอบสองเผื่อจังหวะหลุด
+  for (uint8_t ch = CH_MIN; ch <= CH_MAX; ch++) {
+    if (probeChannelOnce(ch, 120)) {
+      channelLocked = true;
+      lastAckMs = millis();
+      Serial.printf("[CH] locked(retry) at %u\n", ch);
+      return true;
+    }
+  }
+  
+  channelLocked = false;
+  Serial.println("[CH] lock failed");
+  return false;
+}
+
+void maintainChannelLock() {
+  static unsigned long lastPingKeepAliveMs = 0;
+  unsigned long now = millis();
+
+  // ถ้ายังไม่ล็อก -> พยายามหาเลย
+  if (!channelLocked) {
+    scanAndLockChannel();
+    return;
+  }
+
+  // keep-alive ทุก 2 วินาทีด้วย ping
+  if (now - lastPingKeepAliveMs >= 2000UL) {
+    lastPingKeepAliveMs = now;
+    if (!probeChannelOnce(currentChannel, 80)) {
+      lastAckMs = millis();
+      // ไม่ตอบครั้งเดียวไม่ฟันธง รอ timeout จริง
+    }
+  }
+
+  // timeout -> ปลดล็อกแล้วสแกนใหม่
+  if (now - lastAckMs > LINK_LOST_MS) {
+    Serial.println("[CH] link lost -> re-scan");
+    channelLocked = false;
+  }
 }
 
 void sendLuxPacket() {
@@ -265,21 +389,30 @@ void setup() {
 
   // ล็อก channel ให้ตรงกับ Node B (สำคัญ)
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
   Serial.print("[WiFi] STA MAC: ");
   Serial.println(WiFi.macAddress());
-  Serial.printf("[WiFi] Channel fixed to %u\n", ESPNOW_CHANNEL);
 
   if (!initEspNowTx()) {
     Serial.println("ESP-NOW TX init error");
   }
 
+  setWifiChannel(1);
+  scanAndLockChannel();
+
   Serial.println("Node A Ready");
 }
 
 void loop() {
+  maintainChannelLock();
+
+  // ยังไม่ lock channel อย่าส่ง soil/lux
+  if (!channelLocked) {
+    delay(20);
+    return;
+  }
+
   unsigned long now = millis();
 
   if (now - lastSoilTxMs >= SOIL_TX_INTERVAL_MS) {
@@ -287,7 +420,6 @@ void loop() {
     sendSoilPacket();
   }
 
-  // ส่ง BH1750 แยก packet (เผื่ออนาคต)
   if (now - lastLuxTxMs >= LUX_TX_INTERVAL_MS) {
     lastLuxTxMs = now;
     sendLuxPacket();
