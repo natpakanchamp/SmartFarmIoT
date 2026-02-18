@@ -125,7 +125,8 @@ enum MsgType : uint8_t {
 };
 
 // ================= ESP-NOW fixed channel config =================
-const uint8_t ESPNOW_CHANNEL = 9;   // << ตั้งให้ตรง Node A และ WiFi AP
+  //const uint8_t ESPNOW_CHANNEL = 9;   // << ตั้งให้ตรง Node A และ WiFi AP
+const uint8_t ESPNOW_CHANNEL = 6; 
 // ===============================================================
 
 #define SOIL_COUNT 4
@@ -327,11 +328,12 @@ const char* phaseText(GrowPhase p) {
 // วันเริ่มปลูก (local epoch)
 time_t transplantEpoch = 0;
 
-void lockEspNowChannelToFixed() {
+void lockEspNowChannelToWifi() {
+  uint8_t ch = WiFi.channel();
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
-  Serial.printf("[ESP-NOW] forced channel=%u\n", ESPNOW_CHANNEL);
+  Serial.printf("[ESP-NOW] locked to WiFi channel=%u\n", ch);
 }
 
 // --------------------- Interrupt ---------------------
@@ -565,7 +567,7 @@ void handleNetwork() {
     delay(1200);
     timezoneSync();
     struct tm ti;
-    lockEspNowChannelToFixed();
+    lockEspNowChannelToWifi();
     if (getLocalTimeSafe(&ti)) {
       updateDisplay_Buffered(ti.tm_hour, ti.tm_min);
     }
@@ -1666,7 +1668,7 @@ void setup() {
   Serial.println();
 
   if (wifiMulti.run() == WL_CONNECTED) {
-    lockEspNowChannelToFixed();
+    lockEspNowChannelToWifi();
     Serial.printf("[WiFi] channel=%d\n", WiFi.channel());
   } else {
     Serial.println("[WiFi] connect timeout, ESP-NOW may fail if channel mismatch");
