@@ -31,7 +31,8 @@ const int WATER_VALUE = 970;    // เปียก
 const uint8_t CH_MIN = 1;
 const uint8_t CH_MAX = 13;
 
-const uint8_t ESPNOW_CHANNEL = 9;   // ต้องตรง Node B
+//const uint8_t ESPNOW_CHANNEL = 9;   // ต้องตรง Node B
+const uint8_t ESPNOW_CHANNEL = 6;
 
 volatile bool ackReceived = false;
 volatile uint32_t ackSeqRx = 0;
@@ -219,7 +220,7 @@ bool initEspNowTx() {
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, NODE_B_MAC, 6);
-  peerInfo.channel = 9;   // dynamic: ใช้ current channel ของ STA
+  peerInfo.channel = ESPNOW_CHANNEL;   // dynamic: ใช้ current channel ของ STA
   peerInfo.encrypt = false;
 
   if (esp_now_is_peer_exist(NODE_B_MAC)) {
