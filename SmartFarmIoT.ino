@@ -381,6 +381,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  Serial.println(WiFi.macAddress());
+
   for (uint8_t i = 0; i < SOIL_COUNT; i++) {
     pinMode(SOIL_PINS[i], INPUT);
   }
