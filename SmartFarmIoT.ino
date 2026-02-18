@@ -122,6 +122,8 @@ static const char* TZ_INFO = "<+07>-7";   // UTC+7
 enum MsgType : uint8_t {
   MSG_SOIL = 1,
   MSG_LUX  = 2,
+  MSG_PING = 3,
+  MSG_ACK  = 4
 };
 
 // ================= ESP-NOW fixed channel config =================
@@ -1341,11 +1343,44 @@ bool isSameMac(const uint8_t* a, const uint8_t* b) {
   return true;
 }
 
+void ensurePeer(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) return;
+  esp_now_peer_info_t p{};
+  memcpy(p.peer_addr, mac, 6);
+  p.channel = 0;       // ใช้ช่องปัจจุบัน
+  p.encrypt = false;
+  esp_now_add_peer(&p);
+}
+
 // -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!info || !data || len < 1) return;
 
+  // ต้อง add peer ก่อนค่อยส่งกลับ (ESP-NOW ต้องมี peer)
+  ensurePeer(info->src_addr);
+
   uint8_t type = data[0];
+
+  // ---------- PING ----------
+  if (type == MSG_PING) {
+    if (len != (int)sizeof(PingPacket)) {
+      Serial.printf("[RX PING] bad len=%d expect=%u\n", len, (unsigned)sizeof(PingPacket));
+      return;
+    }
+
+    PingPacket p{};
+    memcpy(&p, data, sizeof(p));
+
+    AckPacket a{};
+    a.msgType = MSG_ACK;
+    a.seq = p.seq;                 // echo seq จาก ping
+    a.uptimeMs = millis();
+    esp_now_send(info->src_addr, (uint8_t*)&a, sizeof(a));
+
+    Serial.printf("[RX PING] from=%s seq=%lu -> ACK\n",
+      macToString(info->src_addr).c_str(), (unsigned long)p.seq);
+    return;
+  }
 
   // ---------- SOIL ----------
   if (type == MSG_SOIL) {
@@ -1354,9 +1389,10 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
       return;
     }
 
-    SoilPacket pkt;
+    SoilPacket pkt{};
     memcpy(&pkt, data, sizeof(pkt));
 
+    // clamp
     for (int i = 0; i < SOIL_COUNT; i++) {
       if (pkt.soilPct[i] < 0) pkt.soilPct[i] = 0;
       if (pkt.soilPct[i] > 100) pkt.soilPct[i] = 100;
@@ -1370,6 +1406,13 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     lastSoilRxMs = millis();
     interrupts();
 
+    // (เลือกได้) ส่ง ACK ให้ Node A ด้วย seq ของ SOIL ก็ได้
+    AckPacket a{};
+    a.msgType = MSG_ACK;
+    a.seq = pkt.seq;               // echo soil seq
+    a.uptimeMs = millis();
+    esp_now_send(info->src_addr, (uint8_t*)&a, sizeof(a));
+
     Serial.printf("[RX SOIL] from=%s seq=%lu p=[%d,%d,%d,%d] mask=0x%02X\n",
       macToString(info->src_addr).c_str(),
       (unsigned long)pkt.seq,
@@ -1378,14 +1421,14 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     return;
   }
 
-  // ---------- LUX (BH1750) ----------
+  // ---------- LUX ----------
   if (type == MSG_LUX) {
     if (len != (int)sizeof(LuxPacket)) {
       Serial.printf("[RX LUX ] bad len=%d expect=%u\n", len, (unsigned)sizeof(LuxPacket));
       return;
     }
 
-    LuxPacket lp;
+    LuxPacket lp{};
     memcpy(&lp, data, sizeof(lp));
 
     bool luxOk = (lp.sensorOk == 1) &&
@@ -1406,7 +1449,6 @@ void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
     return;
   }
 
-  // ignore อื่น ๆ
   Serial.printf("[ESP-NOW] unknown type=%u len=%d\n", (unsigned)type, len);
 }
 
