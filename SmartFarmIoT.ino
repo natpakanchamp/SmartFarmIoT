@@ -184,7 +184,7 @@ volatile unsigned long lastLuxRxMs = 0;
 const unsigned long LUX_RX_TIMEOUT_MS = 15000UL;
 
 // 1C:C3:AB:B4:77:CC
-//const uint8_t ALLOWED_SENDER_MAC[6] = {0x1C, 0xC3, 0xAB, 0xB4, 0x77, 0xCC}; // แก้เป็น MAC ของ Node A จริง
+const uint8_t ALLOWED_SENDER_MAC[6] = {0xD4, 0xE9, 0xF4, 0xC5, 0x39, 0x60}; // แก้เป็น MAC ของ Node A จริง
 //bool isSameMac(const uint8_t* a, const uint8_t* b);
 
 // --------------------- Runtime timers ---------------------
@@ -262,6 +262,10 @@ const char* pass_3 = "ffffffff";
 // const char* pass_3 = "9876543210";
 
 // --------------------- MQTT ---------------------
+// --- MQTT robustness ---
+IPAddress mqtt_broker_ip(34, 233, 150, 46);   // IP fallback (ใช้ทดสอบเวลา DNS พัง)
+unsigned long lastMqttAttemptMs = 0;
+const unsigned long MQTT_RETRY_MS = 3000UL;
 const char* mqtt_broker = "broker.emqx.io";
 const int mqtt_port = 1883;
 const char* mqtt_client_id = "Group8/lnwza555";
@@ -587,18 +591,48 @@ void handleNetwork() {
     if (!isWifiConnected) {
       Serial.println("[WiFi] Lost... reconnecting");
     } else if (!client.connected()) {
-      Serial.print("[MQTT] Connecting...");
-      String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
+  // กัน spam connect ถี่เกินไป
+  if (millis() - lastMqttAttemptMs < MQTT_RETRY_MS) return;
+  lastMqttAttemptMs = millis();
 
-      if (client.connect(clientId.c_str())) {
-        Serial.println("Connected!");
-        client.subscribe(mqtt_topic_cmd);
-        client.publish(topic_status, "SYSTEM RECOVERED");
-      } else {
-        Serial.print("failed, rc=");
-        Serial.println(client.state());
-      }
-    }
+  // เช็ค DNS ก่อน (Hotspot บางอันต่อ WiFi ได้ แต่ DNS/เน็ตไม่ออก)
+  IPAddress resolved;
+  bool dnsOk = WiFi.hostByName(mqtt_broker, resolved);
+  Serial.printf("[MQTT] DNS %s -> %s (%s)\n",
+                mqtt_broker,
+                dnsOk ? resolved.toString().c_str() : "FAIL",
+                dnsOk ? "OK" : "FAIL");
+
+  // ถ้า DNS ได้ ใช้ชื่อ host ตามปกติ / ถ้าไม่ได้ ลอง IP fallback
+  if (dnsOk) {
+    client.setServer(mqtt_broker, mqtt_port);
+  } else {
+    client.setServer(mqtt_broker_ip, mqtt_port);
+    Serial.printf("[MQTT] using IP fallback: %s\n", mqtt_broker_ip.toString().c_str());
+  }
+
+  // ClientID ต้อง "คงที่" (ห้ามสุ่มทุกครั้ง)
+  // และห้ามมี "/" ตามสเปค MQTT client id บาง broker จะไม่ชอบ
+  String clientId = String("Group8_NodeB_") + WiFi.macAddress();
+  clientId.replace(":", ""); // เอา : ออกให้สั้นและปลอดภัย
+
+  Serial.printf("[MQTT] Connecting as %s ...\n", clientId.c_str());
+
+  if (client.connect(clientId.c_str())) {
+    Serial.println("[MQTT] Connected!");
+    client.subscribe(mqtt_topic_cmd);
+    client.publish(topic_status, "SYSTEM RECOVERED", true);
+  } else {
+    Serial.print("[MQTT] failed, state=");
+    Serial.println(client.state());
+
+    // เพิ่มข้อมูล debug เน็ต
+    Serial.print("[NET] IP="); Serial.println(WiFi.localIP());
+    Serial.print("[NET] GW="); Serial.println(WiFi.gatewayIP());
+    Serial.print("[NET] DNS="); Serial.println(WiFi.dnsIP());
+    Serial.print("[NET] RSSI="); Serial.println(WiFi.RSSI());
+  }
+}
 
     if (isWifiConnected) {
       if (millis() - lastTimeResyncAttempt > 3600000UL) {
@@ -1347,7 +1381,7 @@ void ensurePeer(const uint8_t* mac) {
   if (esp_now_is_peer_exist(mac)) return;
   esp_now_peer_info_t p{};
   memcpy(p.peer_addr, mac, 6);
-  p.channel = 0;       // ใช้ช่องปัจจุบัน
+  p.channel = ESPNOW_CHANNEL;      // ใช้ช่องปัจจุบัน
   p.encrypt = false;
   esp_now_add_peer(&p);
 }
@@ -1355,9 +1389,12 @@ void ensurePeer(const uint8_t* mac) {
 // -------------- ESP-NOW receive callback (ESP32 core ใหม่) -----------------------
 void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!info || !data || len < 1) return;
-
+  if (!isSameMac(info->src_addr, ALLOWED_SENDER_MAC)) {
+    Serial.printf("[ESP-NOW] drop unknown mac=%s\n", macToString(info->src_addr).c_str());
+    return;
+  }
   // ต้อง add peer ก่อนค่อยส่งกลับ (ESP-NOW ต้องมี peer)
-  ensurePeer(info->src_addr);
+  //ensurePeer(info->src_addr);
 
   uint8_t type = data[0];
 
@@ -1631,6 +1668,8 @@ void setup() {
   tzset();
   // ใช้ STA เพื่อทำงานร่วมกับ WiFi + MQTT ได้
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  // ใส่ไว้ชั่วคราว
 
   Serial.println("\n--- System Starting ---");
   Wire.begin(SDA, SCL);
@@ -1692,6 +1731,8 @@ void setup() {
   // MQTT
   client.setServer(mqtt_broker, mqtt_port);
   client.setCallback(callback);
+  client.setKeepAlive(30);        // ทนเน็ตมือถือ/ฮอตสปอตกว่า
+  client.setSocketTimeout(5);     // กันค้างนาน
 
   // WiFi
   wifiMulti.addAP(ssid_3, pass_3);
@@ -1710,11 +1751,12 @@ void setup() {
   Serial.println();
 
   if (wifiMulti.run() == WL_CONNECTED) {
-    lockEspNowChannelToWifi();
     Serial.printf("[WiFi] channel=%d\n", WiFi.channel());
   } else {
     Serial.println("[WiFi] connect timeout, ESP-NOW may fail if channel mismatch");
   }
+
+  lockEspNowChannelToWifi();
 
   // Init ESP-NOW receiver (Node B)
   if (!initEspNowReceiver()) {
