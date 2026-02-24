@@ -25,12 +25,11 @@
 // 4. กำหนดขา Pin สำหรับ ESP32 (เช็คสายจริงของท่านด้วยนะครับ)
 // =================================================
 // ท่านต้องต่อสายตามนี้ หรือแก้ตัวเลขให้ตรงกับที่ท่านเสียบจริง
-#define TFT_MISO -1   // ไม่ใช้ (จอพวกนี้ส่วนมากไม่มีขา MISO)
-#define TFT_MOSI 23   // ต่อขา SDA ของจอ
-#define TFT_SCLK 18   // ต่อขา SCL ของจอ
-#define TFT_CS    5   // ต่อขา CS
-#define TFT_DC    17   // ต่อขา DC (บางทีเขียนว่า RS)
-#define TFT_RST   19   // ต่อขา RES (ถ้าต่อกับปุ่ม Reset ของบอร์ด ให้ใส่ -1)
+#define TFT_MOSI 23
+#define TFT_SCLK 18
+#define TFT_CS   -1   // *** ไม่มี CS ***
+#define TFT_DC   25
+#define TFT_RST  5
 
 // #define TFT_BL 32  // ถ้ามีขา BLK/Backlight ให้เปิดบรรทัดนี้และใส่ขา Pin
 
