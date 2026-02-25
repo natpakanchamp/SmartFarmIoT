@@ -11,8 +11,12 @@
   - WiFiMulti + MQTT robust reconnect (DNS check + IP fallback, throttle, logs)
   - RTC + NTP fallback (timezone), hourly resync
   - TFT buffered UI (3 pages: Operate / Health / Control)
+  - HTTP long-poll attributes updates (for dashboard/API control) + MQTT control kept for future
   ------------------------------------------------------------
 */
+
+#include <HTTPClient.h>
+
 #include "SmartFarmTypes.h"
 #include <Wire.h>
 #include <BH1750.h>
@@ -61,7 +65,6 @@ const float LUX_MIN_VALID = 0.0f;
 const float LUX_MAX_VALID = 120000.0f;
 
 // --------------------- Light Conversion ---------------------
-// Tune later based on your fixtures
 float SUN_FACTOR   = 0.0185f;
 float LIGHT_FACTOR = 0.0135f;
 
@@ -89,20 +92,21 @@ const unsigned long DRYBACK_MIN_INTERVAL_MS = 45UL * 60UL * 1000UL;
 const unsigned long SOIL_RX_TIMEOUT_MS = 15000UL;
 const unsigned long LUX_RX_TIMEOUT_MS  = 15000UL;
 
+// --------------------- HTTP (Device API host for attributes) ---------------------
+const char* TB_HOST  = "device.techmorrow.co";  // HTTP API host (NOT mqtt host)
+const char* TB_TOKEN = "vBDE9tTsuz09nMWWJZkA";  // token
+
 // --------------------- MQTT ---------------------
-// IPAddress mqtt_broker_ip(34, 233, 150, 46); // IP fallback if DNS fails
 unsigned long lastMqttAttemptMs = 0;
 const unsigned long MQTT_RETRY_MS = 3000UL;
-// const char* mqtt_broker = "broker.emqx.io";
-// const int mqtt_port = 1883;
 
+// EMQX TCP (PubSubClient รองรับ)
 const char* mqtt_broker = "caboose.proxy.rlwy.net";
 const int   mqtt_port   = 25668;
-const char* topic_telemetry = "v1/devices/me/telemetry";
-
-const char* mqtt_user = "vBDE9tTsuz09nMWWJZkA";
+const char* mqtt_user = "vBDE9tTsuz09nMWWJZkA";   // EMQX public ใช้ anonymous ได้
 const char* mqtt_pass = "";
 
+const char* topic_telemetry = "v1/devices/me/telemetry";
 const char* mqtt_topic_cmd = "group8/command";
 
 const char* topic_status    = "group8/status";
@@ -116,8 +120,8 @@ const char* topic_soil_link = "group8/link/soilA";
 const char* topic_light     = "group8/light/main";
 
 // --------------------- WiFi ---------------------
-const char* ssid_3 = "JebHuaJai";
-const char* pass_3 = "ffffffff";
+const char* ssid_3 = "CPE-9634";
+const char* pass_3 = "9876543210";
 
 // --------------------- NVS keys ---------------------
 const char* KEY_DLI         = "dli";
@@ -159,7 +163,6 @@ typedef struct __attribute__((packed)) {
 // ============================================================
 // ===================== Growth phases =========================
 // ============================================================
-
 struct PhaseParams {
   float dliTarget;
   uint16_t photoStartMin;
@@ -341,9 +344,7 @@ private:
 // ============================================================
 class EspNowRxService {
 public:
-  EspNowRxService(const uint8_t allowedMac[6]) {
-    memcpy(allowedMac_, allowedMac, 6);
-  }
+  EspNowRxService(const uint8_t allowedMac[6]) { memcpy(allowedMac_, allowedMac, 6); }
 
   bool begin() {
     instance_ = this;
@@ -360,7 +361,6 @@ public:
     return true;
   }
 
-  // snapshots
   bool soilHealthy() const {
     if (!hasSoil_) return false;
     if ((millis() - lastSoilRxMs_) > SOIL_RX_TIMEOUT_MS) return false;
@@ -406,7 +406,6 @@ private:
   static EspNowRxService* instance_;
   uint8_t allowedMac_[6]{};
 
-  // rx buffers
   volatile bool hasSoil_ = false;
   volatile int soilPct_[SOIL_COUNT] = {0,0,0,0};
   volatile uint8_t soilOkMask_ = 0;
@@ -509,7 +508,6 @@ public:
     }
     enoughValid = true;
 
-    // sort
     for (int i=1;i<n;i++){
       int key=a[i], j=i-1;
       while (j>=0 && a[j]>key){ a[j+1]=a[j]; j--; }
@@ -521,7 +519,6 @@ public:
     else if (n == 3) agg = a[1];
     else agg = (int)roundf((a[0] + a[1]) / 2.0f);
 
-    // EMA
     if (!emaInit_) { ema_ = (float)agg; emaInit_ = true; }
     else ema_ = alpha_ * agg + (1.0f - alpha_) * ema_;
 
@@ -690,7 +687,6 @@ public:
   }
 
   void update(SystemState &st, int soilPct, float lux) {
-    // failsafe if remote soil lost (auto only)
     if (!st.valveManual && !st.remoteSoilHealthy) {
       st.reason = "Failsafe: remote soil timeout";
       forceOff_(st);
@@ -706,7 +702,6 @@ public:
       return;
     }
 
-    // Emergency
     if (soilPct < SOIL_CRITICAL) {
       st.reason = "Emergency watering: soil critical";
       st.emergency = true;
@@ -733,7 +728,6 @@ public:
       return;
     }
 
-    // feed-forward: stronger sun -> slightly higher low in phase2
     int lowAdaptive = st.phaseCfg.soilLow;
     float ppfdSun = lux * SUN_FACTOR;
     if (st.phase == PHASE_2_VEGETATIVE && ppfdSun > 500.0f) {
@@ -741,7 +735,6 @@ public:
     }
 
     if (st.phaseCfg.dryBackMode) {
-      // finishing: deep & dryback interval
       if (soilPct <= lowAdaptive) {
         if (millis() - lastDryBackWaterMs_ >= DRYBACK_MIN_INTERVAL_MS) {
           if (irrState_ == IRR_IDLE) {
@@ -765,7 +758,6 @@ public:
       return;
     }
 
-    // phase 1/2 maintain band
     if (soilPct <= lowAdaptive && !pulseActive_ && !st.valveOn) {
       if (pulseCycleCount_ < MAX_PULSE_CYCLES_PER_CALL && irrState_ == IRR_IDLE) {
         startAdaptivePulse_(st, soilPct, targetMid_(st), false);
@@ -793,11 +785,8 @@ private:
   Preferences &prefs_;
 
   unsigned long lastSwitchMs_ = 0;
-
-  // pulse state
   bool pulseActive_ = false;
 
-  // learning SM
   IrrMicroState irrState_ = IRR_IDLE;
   int soilBeforePulse_ = -1;
   int soilAfterPulse_  = -1;
@@ -813,7 +802,6 @@ private:
 
   float lastPulseSec_ = 0.0f;
 
-  // models per phase
   PulseModel modelP1_ = {0.35f, 0.25f, 6.0f, 35.0f};
   PulseModel modelP2_ = {0.45f, 0.25f, 6.0f, 35.0f};
   PulseModel modelP3_ = {0.30f, 0.25f, 5.0f, 25.0f};
@@ -874,7 +862,6 @@ private:
 
     pm->kWetEst = pm->emaBeta * kNew + (1.0f - pm->emaBeta) * pm->kWetEst;
 
-    // save
     if (st.phase == PHASE_1_ESTABLISH) prefs_.putFloat(KEY_KWET_P1, modelP1_.kWetEst);
     else if (st.phase == PHASE_2_VEGETATIVE) prefs_.putFloat(KEY_KWET_P2, modelP2_.kWetEst);
     else prefs_.putFloat(KEY_KWET_P3, modelP3_.kWetEst);
@@ -939,7 +926,6 @@ private:
   }
 
   void publishDebug_(SystemState &st) {
-    // export key debug values to state for UI/control page
     PulseModel* pm = modelByPhase_(st.phase);
     st.lastPulseSec = lastPulseSec_;
     st.kWetEst = pm ? pm->kWetEst : -1.0f;
@@ -1063,7 +1049,6 @@ private:
 
 // ============================================================
 // ===================== Net+MQTT Service (robust) ==============
-// IMPORTANT: name NOT "NetworkManager" to avoid collision
 // ============================================================
 class NetMqttService {
 public:
@@ -1089,7 +1074,6 @@ public:
   }
 
   void update(SystemState &st, TimeService &timeSvc) {
-    // periodic network tick
     if (millis() - lastNetworkCheckMs_ < NETWORK_INTERVAL) return;
     lastNetworkCheckMs_ = millis();
 
@@ -1114,7 +1098,6 @@ public:
       return;
     }
 
-    // MQTT reconnect
     if (!mqtt_.connected()) {
       if (millis() - lastMqttAttemptMs < MQTT_RETRY_MS) return;
       lastMqttAttemptMs = millis();
@@ -1125,14 +1108,19 @@ public:
       clientId.replace(":", "");
       Serial.printf("[MQTT] Connecting as %s ...\n", clientId.c_str());
 
-      // PubSubClient: ใช้ได้แค่ connect(id) หรือ connect(id,user,pass)
       bool okConn = mqtt_.connect(clientId.c_str(), mqtt_user, mqtt_pass);
 
       if (okConn) {
         Serial.println("[MQTT] Connected!");
         mqtt_.subscribe(mqtt_topic_cmd);
+
+        // keep MQTT attributes path for future (dashboard control)
         mqtt_.subscribe("v1/devices/me/attributes");
+        mqtt_.subscribe("v1/devices/me/attributes/request/1");
+        mqtt_.subscribe("v1/devices/me/attributes/response/+");
+
         mqtt_.publish(topic_status, "SYSTEM RECOVERED", true);
+
         mqtt_.publish("v1/devices/me/attributes/request/1",
           "{\"sharedKeys\":\"lightMode,lightCmd,valveMode,valveCmd\"}");
       } else {
@@ -1144,7 +1132,6 @@ public:
       }
     }
 
-    // hourly resync
     if (millis() - lastTimeResyncAttemptMs_ > 3600000UL) {
       lastTimeResyncAttemptMs_ = millis();
       timeSvc.timezoneSync(st);
@@ -1166,7 +1153,6 @@ private:
 // ============================================================
 // ===================== Telemetry Service =====================
 // ============================================================
-
 static void jsonEscapeTo(char* out, size_t outSize, const char* in) {
   if (!out || outSize == 0) return;
   size_t j = 0;
@@ -1191,17 +1177,14 @@ public:
     lastTelemetryMs_ = millis();
     if (!mqtt_.connected()) return;
 
-    // reason -> safe JSON string
     char reasonEsc[96];
     String r = st.reason;
     if (r.length() > 80) r = r.substring(0, 80);
     jsonEscapeTo(reasonEsc, sizeof(reasonEsc), r.c_str());
 
-    // NOTE: ใช้ -1 / "N/A" สำหรับค่าที่ไม่ valid
     float luxOut = (!isnan(st.lux) && !isinf(st.lux)) ? st.lux : -1.0f;
 
-    // payload (เพิ่ม buffer เป็น 512-1024 ตามคุณตั้งไว้แล้ว)
-    char payload[768];
+    char payload[1024];
     int n = snprintf(payload, sizeof(payload),
       "{"
         "\"soil\":%d,"
@@ -1254,13 +1237,79 @@ public:
       return;
     }
 
-    bool ok = mqtt_.publish(topic_telemetry, payload, false); // retain=false
+    bool ok = mqtt_.publish(topic_telemetry, payload, false);
     Serial.printf("[MQTT] pub=%s | %s\n", ok ? "OK" : "FAIL", payload);
   }
 
 private:
   PubSubClient &mqtt_;
   unsigned long lastTelemetryMs_ = 0;
+};
+
+// ============================================================
+// =========== HTTP attributes updates (control via API) =======
+// ============================================================
+
+static bool jsonGet01_global(const char* json, const char* key, int &out01) {
+  char pat[48];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char* p = strstr(json, pat);
+  if (!p) return false;
+
+  p = strchr(p, ':');
+  if (!p) return false;
+  p++;
+  while (*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+
+  if (*p == '0') { out01 = 0; return true; }
+  if (*p == '1') { out01 = 1; return true; }
+  return false;
+}
+
+class HttpAttrCommandService {
+public:
+  void begin() {}
+
+  void poll(SystemState &st, Relay &relayLight, Relay &relayValve) {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    unsigned long now = millis();
+    if (now - lastPollMs_ < POLL_MS_) return;
+    lastPollMs_ = now;
+
+    HTTPClient http;
+    String url = String("http://") + TB_HOST + "/api/v1/" + TB_TOKEN + "/attributes/updates?timeout=15000";
+    http.begin(url);
+
+    int code = http.GET();
+    if (code != 200) {
+      http.end();
+      return;
+    }
+
+    String body = http.getString();
+    http.end();
+
+    handleJson_(body.c_str(), st, relayLight, relayValve);
+  }
+
+private:
+  unsigned long lastPollMs_ = 0;
+  const unsigned long POLL_MS_ = 300;
+
+  void handleJson_(const char* msg, SystemState &st, Relay &relayLight, Relay &relayValve) {
+    int v;
+
+    if (jsonGet01_global(msg, "lightMode", v)) st.lightManual = (v == 1);
+    if (jsonGet01_global(msg, "valveMode", v)) st.valveManual = (v == 1);
+
+    if (jsonGet01_global(msg, "lightCmd", v)) {
+      if (st.lightManual) { relayLight.write(v == 1); st.lightOn = (v == 1); }
+    }
+    if (jsonGet01_global(msg, "valveCmd", v)) {
+      if (st.valveManual) { relayValve.write(v == 1); st.valveOn = (v == 1); }
+    }
+  }
 };
 
 // ============================================================
@@ -1330,7 +1379,6 @@ private:
   }
 
   void drawOperate_(const SystemState &st) {
-    // SOIL
     spr_.fillRoundRect(8, 40, 108, 74, 10, TFT_NAVY);
     spr_.setTextDatum(TL_DATUM);
     spr_.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -1343,7 +1391,6 @@ private:
     spr_.setTextDatum(MC_DATUM);
     spr_.drawNumber(st.soilPercent, 62, 84);
 
-    // LUX
     spr_.fillRoundRect(124, 40, 108, 74, 10, TFT_DARKGREEN);
     spr_.setTextDatum(TL_DATUM);
     spr_.setTextColor(TFT_WHITE, TFT_DARKGREEN);
@@ -1356,7 +1403,6 @@ private:
     if (!isnan(st.lux) && !isinf(st.lux)) luxText = String((int)st.lux);
     spr_.drawString(luxText, 178, 84);
 
-    // DLI
     spr_.fillRoundRect(8, 120, 224, 46, 10, TFT_MAROON);
     spr_.setTextDatum(TL_DATUM);
     spr_.setTextSize(1);
@@ -1369,7 +1415,6 @@ private:
     spr_.setTextColor(dliCol, TFT_MAROON);
     spr_.drawString(String(st.dliToday, 1) + " / " + String(st.phaseCfg.dliTarget, 1), 224, 152);
 
-    // VALVE / LIGHT
     spr_.fillRoundRect(8, 172, 108, 32, 8, TFT_BLACK);
     spr_.drawRoundRect(8, 172, 108, 32, 8, TFT_WHITE);
     spr_.setTextDatum(MC_DATUM);
@@ -1386,7 +1431,6 @@ private:
     spr_.setTextColor(st.lightOn ? TFT_GREEN : TFT_RED, TFT_BLACK);
     spr_.drawString(st.lightOn ? "ON" : "OFF", 204, 188);
 
-    // Reason
     spr_.fillRoundRect(8, 208, 224, 28, 8, TFT_DARKGREY);
     spr_.setTextDatum(TL_DATUM);
     spr_.setTextSize(1);
@@ -1423,8 +1467,6 @@ private:
     row("Lux Rx Age", String(st.luxRxAgeMs) + " ms", (st.luxRxAgeMs <= LUX_RX_TIMEOUT_MS) ? TFT_GREEN : TFT_RED);
 
     row("WiFi", (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "LOST", colorByBool(WiFi.status() == WL_CONNECTED));
-    // MQTT connected = green else red (use st.timeSynced row separately)
-    // can't access mqtt here (UI only reads state); keep minimal:
     row("Time Sync", st.timeSynced ? "OK" : "INVALID", colorByBool(st.timeSynced));
   }
 
@@ -1494,32 +1536,25 @@ public:
 
     Wire.begin(SDA, SCL);
 
-    // UI init
     ui_.begin();
 
-    // NVS
     prefs_.begin("smartfarm", false);
     st_.dliToday = prefs_.getFloat(KEY_DLI, 0.0f);
     st_.transplantEpoch = (time_t)prefs_.getULong64(KEY_TRANS_EPOCH, 0ULL);
 
-    // RTC + alarm
     timeSvc_.begin(st_);
 
-    // Relays
     relayLight_.begin(false);
     relayValve_.begin(false);
     st_.lightOn = relayLight_.isOn();
     st_.valveOn = relayValve_.isOn();
 
-    // Local Lux fallback
     localLux_.begin();
 
-    // MQTT + WiFi
     netSvc_.begin();
     mqtt_.setCallback(App::mqttCallbackStatic);
     instance_ = this;
 
-    // initial wifi connect splash
     Serial.print("Connecting WiFi");
     unsigned long startAttempt = millis();
     while (millis() - startAttempt < 15000UL) {
@@ -1535,19 +1570,17 @@ public:
       Serial.println("[WiFi] connect timeout, ESP-NOW may fail if channel mismatch");
     }
 
-    // lock esp-now channel to wifi (critical for fixed channel setups)
+    // HTTP attributes poll (keep alive)
+    // httpCmd_.begin();
+
     netSvc_.lockEspNowChannelToWifi();
 
-    // ESP-NOW RX
     if (!espNowRx_.begin()) Serial.println("[ESP-NOW] RX init error");
 
-    // time sync now if possible
     if (WiFi.status() == WL_CONNECTED) timeSvc_.timezoneSync(st_);
 
-    // DLI restore
     dli_.restore(st_);
 
-    // Initialize transplantEpoch if empty
     struct tm ti;
     if (timeSvc_.getLocalTimeSafe(&ti)) {
       if (st_.transplantEpoch == 0) {
@@ -1564,28 +1597,23 @@ public:
       phaseMgr_.apply(st_, PHASE_1_ESTABLISH);
     }
 
-    // Restore AutoTune models
     irrCtl_.restoreModels();
-
-    // Restore flags (if you still use them later)
-    // bool mDone = prefs_.getBool(KEY_MDONE, false);
-    // bool eDone = prefs_.getBool(KEY_EDONE, false);
 
     st_.reason = "System Ready";
     ui_.update(st_, 12, 0);
   }
 
   void update() {
-    // network + mqtt maintenance
     netSvc_.update(st_, timeSvc_);
     netSvc_.loopMqtt();
 
-    // RTC tick debug
+    // HTTP attributes updates (dashboard/API control)
+    // httpCmd_.poll(st_, relayLight_, relayValve_);
+
     if (timeSvc_.consumeMinuteTick()) {
       Serial.println("[SQW] Minute Tick");
     }
 
-    // Control loop
     if (millis() - lastCalcUpdate_ >= CONTROL_INTERVAL) {
       lastCalcUpdate_ = millis();
 
@@ -1600,7 +1628,6 @@ public:
 
         handleDailyReset_(timeinfo);
 
-        // phase update
         int day = phaseMgr_.daysAfterTransplant(timeinfo, st_.transplantEpoch);
         GrowPhase_t newP = phaseMgr_.phaseFromDay(day);
         if (newP != st_.phase) {
@@ -1609,7 +1636,6 @@ public:
           Serial.printf("[Phase Change] Day=%d -> Phase=%d\n", day, (int)st_.phase);
         }
 
-        // ----- ESP-NOW snapshots -----
         int soil4[SOIL_COUNT]; uint8_t okMask; uint32_t sSeq; unsigned long sAge;
         espNowRx_.getSoilSnapshot(soil4, okMask, sSeq, sAge);
 
@@ -1622,7 +1648,6 @@ public:
         st_.soilSeq     = sSeq;
         st_.luxSeq      = lSeq;
 
-        // valid count
         int cnt = 0;
         for (int i=0;i<SOIL_COUNT;i++) if (okMask & (1<<i)) cnt++;
         st_.soilValidCnt = (uint8_t)cnt;
@@ -1630,18 +1655,15 @@ public:
         st_.remoteSoilHealthy = espNowRx_.soilHealthy();
         st_.remoteLuxHealthy  = espNowRx_.luxHealthy();
 
-        // Soil percent for control (aggregate+EMA)
         bool enough = false;
         st_.soilPercent = soilAgg_.aggregateAndSmooth(soil4, okMask, enough);
         if (!enough) st_.soilPercent = 100;
 
-        // Lux for control: remote if healthy else local
         if (st_.remoteLuxHealthy) st_.lux = rLux;
         else st_.lux = localLux_.readLuxSafe();
 
         bool luxValid = !isnan(st_.lux) && !isinf(st_.lux) && st_.lux >= LUX_MIN_VALID && st_.lux <= LUX_MAX_VALID;
 
-        // Lux invalid policy
         if (!luxValid) {
           if (!st_.lightManual) {
             relayLight_.write(false);
@@ -1655,7 +1677,6 @@ public:
           irrCtl_.update(st_, st_.soilPercent, st_.lux);
         }
 
-        // Debug
         if (DEBUG_LOG && (millis() - lastDebug_ >= DEBUG_INTERVAL)) {
           lastDebug_ = millis();
           printDebug_(h, m);
@@ -1666,22 +1687,18 @@ public:
         handleNoValidTimeSafeMode_();
       }
 
-      // UI update
       ui_.update(st_, h, m);
     }
 
-    // telemetry
     tele_.publishIfDue(st_);
   }
 
 private:
-  // --- singletons / instance bridge ---
   static App* instance_;
   static void mqttCallbackStatic(char* topic, byte* payload, unsigned int length) {
     if (instance_) instance_->mqttCallback_(topic, payload, length);
   }
 
-  // --- core objects ---
   TFT_eSPI tft_;
   TFT_eSprite sprite_{&tft_};
 
@@ -1707,14 +1724,16 @@ private:
   TelemetryService tele_;
   UiRenderer ui_;
 
+  // HTTP control service (kept alongside MQTT control)
+  // HttpAttrCommandService httpCmd_;
+
   SystemState st_;
 
   unsigned long lastCalcUpdate_ = 0;
   unsigned long lastDebug_ = 0;
   int lastResetDayKey_ = -1;
 
-  // --- helpers ---
-static bool jsonGet01(const char* json, const char* key, int &out01) {
+  static bool jsonGet01(const char* json, const char* key, int &out01) {
     char pat[48];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
     const char* p = strstr(json, pat);
@@ -1723,12 +1742,12 @@ static bool jsonGet01(const char* json, const char* key, int &out01) {
     p = strchr(p, ':');
     if (!p) return false;
     p++;
-    while (*p==' '||*p=='\t') p++;
+    while (*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
 
     if (*p == '0') { out01 = 0; return true; }
     if (*p == '1') { out01 = 1; return true; }
     return false;
-}
+  }
 
   void mqttCallback_(char* topic, byte* payload, unsigned int length) {
     static char msg[256];
@@ -1743,51 +1762,48 @@ static bool jsonGet01(const char* json, const char* key, int &out01) {
 
     Serial.printf("Message [%s] %s\n", topic, msg);
 
-    // === รับ Shared Attributes (0/1) ===
-    if (strcmp(topic, "v1/devices/me/attributes") == 0) {
-  int v;
+    if (strcmp(topic, "v1/devices/me/attributes") == 0 ||
+        strncmp(topic, "v1/devices/me/attributes/response/", 31) == 0) {
 
-  // ---------- LIGHT MODE (0=AUTO,1=MANUAL) ----------
-  if (jsonGet01(msg, "lightMode", v)) {
-    st_.lightManual = (v == 1);
-    Serial.printf("[ATTR] lightMode=%d -> %s\n", v, st_.lightManual ? "MANUAL" : "AUTO");
+      int v;
 
-    // ถ้าเพิ่งสลับกลับ AUTO ให้ปล่อยให้ LightController คุม (ไม่ต้องสั่งรีเลย์ทันที)
-    // ถ้าสลับเป็น MANUAL ให้คงสถานะไฟไว้ก่อน รอ lightCmd มาสั่ง
-  }
+      if (jsonGet01(msg, "lightMode", v)) {
+        st_.lightManual = (v == 1);
+        Serial.printf("[ATTR] lightMode=%d -> %s\n", v, st_.lightManual ? "MANUAL" : "AUTO");
+      }
 
-  // ---------- LIGHT CMD (0=OFF,1=ON) (มีผลเฉพาะตอน MANUAL) ----------
-  if (jsonGet01(msg, "lightCmd", v)) {
-    Serial.printf("[ATTR] lightCmd=%d\n", v);
-    if (st_.lightManual) {
-      relayLight_.write(v == 1);
-      st_.lightOn = (v == 1);
-      Serial.printf(" -> LIGHT %s\n", v ? "ON" : "OFF");
-    } else {
-      Serial.println(" -> ignore lightCmd because LIGHT is AUTO");
+      if (jsonGet01(msg, "lightCmd", v)) {
+        Serial.printf("[ATTR] lightCmd=%d\n", v);
+        if (st_.lightManual) {
+          relayLight_.write(v == 1);
+          st_.lightOn = (v == 1);
+          Serial.printf(" -> LIGHT %s\n", v ? "ON" : "OFF");
+        } else {
+          Serial.println(" -> ignore lightCmd because LIGHT is AUTO");
+        }
+      }
+
+      if (jsonGet01(msg, "valveMode", v)) {
+        st_.valveManual = (v == 1);
+        Serial.printf("[ATTR] valveMode=%d -> %s\n", v, st_.valveManual ? "MANUAL" : "AUTO");
+      }
+
+      if (jsonGet01(msg, "valveCmd", v)) {
+        Serial.printf("[ATTR] valveCmd=%d\n", v);
+        if (st_.valveManual) {
+          relayValve_.write(v == 1);
+          st_.valveOn = (v == 1);
+          Serial.printf(" -> VALVE %s\n", v ? "ON" : "OFF");
+        } else {
+          Serial.println(" -> ignore valveCmd because VALVE is AUTO");
+        }
+      }
+      return;
     }
-  }
 
-  // ---------- VALVE MODE (0=AUTO,1=MANUAL) ----------
-  if (jsonGet01(msg, "valveMode", v)) {
-    st_.valveManual = (v == 1);
-    Serial.printf("[ATTR] valveMode=%d -> %s\n", v, st_.valveManual ? "MANUAL" : "AUTO");
-  }
-
-  // ---------- VALVE CMD (0=OFF,1=ON) (มีผลเฉพาะตอน MANUAL) ----------
-  if (jsonGet01(msg, "valveCmd", v)) {
-    Serial.printf("[ATTR] valveCmd=%d\n", v);
-    if (st_.valveManual) {
-      relayValve_.write(v == 1);
-      st_.valveOn = (v == 1);
-      Serial.printf(" -> VALVE %s\n", v ? "ON" : "OFF");
-    } else {
-      Serial.println(" -> ignore valveCmd because VALVE is AUTO");
-    }
-  }
-
-  return;
-}
+    // ===================== MQTT TILE CONTROL (TYPE A: TEXT COMMANDS) =====================
+    // Topic: group8/command
+    // Payload: VALVE_MANUAL / VALVE_AUTO / VALVE_ON / VALVE_OFF / LIGHT_MANUAL / LIGHT_AUTO / LIGHT_ON / LIGHT_OFF
     if (strcmp(topic, mqtt_topic_cmd) == 0) {
       if (strcmp(msg, "VALVE_MANUAL") == 0) st_.valveManual = true;
       else if (strcmp(msg, "VALVE_AUTO") == 0) st_.valveManual = false;
@@ -1799,7 +1815,6 @@ static bool jsonGet01(const char* json, const char* key, int &out01) {
         if (st_.valveManual) { relayValve_.write(false); st_.valveOn = false; }
         else Serial.println("System is in AUTO Mode!!");
       }
-
       else if (strcmp(msg, "LIGHT_MANUAL") == 0) st_.lightManual = true;
       else if (strcmp(msg, "LIGHT_AUTO") == 0) st_.lightManual = false;
       else if (strcmp(msg, "LIGHT_ON") == 0) {
