@@ -54,7 +54,7 @@ void IRAM_ATTR onRTCAlarm() {
 static const char* TZ_INFO = "<+07>-7";  // Thailand UTC+7
 
 // --------------------- ESP-NOW fixed channel (must match WiFi channel) ---------------------
-const uint8_t ESPNOW_CHANNEL = 6;
+const uint8_t ESPNOW_CHANNEL = 8;
 #define SOIL_COUNT 4
 
 // IMPORTANT: allow only Node A MAC
