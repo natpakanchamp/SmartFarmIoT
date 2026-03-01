@@ -32,6 +32,8 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <string.h>
+#include <WiFiClientSecure.h>
+#include <Update.h>
 
 // --------------------- Pin Mapping ---------------------
 #define RELAY_LIGHT 4
@@ -98,6 +100,19 @@ const unsigned long LUX_RX_TIMEOUT_MS  = 15000UL;
 // --------------------- HTTP (Device API host for attributes) ---------------------
 const char* TB_HOST  = "device.techmorrow.co";  // HTTP API host (NOT mqtt host)
 const char* TB_TOKEN = "vBDE9tTsuz09nMWWJZkA";  // token
+
+// --------------------- OTA (Fixed URL, triggered by dashboard) ---------------------
+// NOTE: ใช้ URL คงที่ ไม่ต้องกรอก URL บน dashboard
+// แนะนำให้เป็น HTTPS direct link ไปที่ไฟล์ .bin
+const char* OTA_URL = "https://natpakanchamp.github.io/SmartFarmIoT/nodeb.bin";
+
+// ถ้าอยากง่ายสุดให้ใช้ setInsecure() (ไม่ตรวจ cert) แต่ความปลอดภัยลดลง
+const bool OTA_TLS_INSECURE = true;
+
+// --------------------- Day Preset (dashboard "Mode" selector) ---------------------
+// dayPreset = 0..(N-1) แล้ว map ไปเป็น "วันหลังย้ายปลูก"
+static const int DAY_PRESETS[] = {0, 7, 21, 30, 46};
+static const int DAY_PRESET_COUNT = sizeof(DAY_PRESETS) / sizeof(DAY_PRESETS[0]);
 
 // --------------------- MQTT ---------------------
 unsigned long lastMqttAttemptMs = 0;
@@ -1185,7 +1200,7 @@ public:
         mqtt_.publish(topic_status, "SYSTEM RECOVERED", true);
 
         mqtt_.publish("v1/devices/me/attributes/request/1",
-          "{\"sharedKeys\":\"lightMode,lightCmd,valveMode,valveCmd\"}");
+  "{\"sharedKeys\":\"lightMode,lightCmd,valveMode,valveCmd,otaGo,dayPreset,resetDay\"}");
       } else {
         Serial.print("[MQTT] failed, state="); Serial.println(mqtt_.state());
         Serial.print("[NET] IP="); Serial.println(WiFi.localIP());
@@ -1672,11 +1687,30 @@ public:
     netSvc_.update(st_, timeSvc_);
     netSvc_.loopMqtt();
 
+    // ---------- OTA runner (run in main loop, not in MQTT callback) ----------
+    if (otaRequested_ && !otaInProgress_) {
+      // กันยิงซ้ำถี่ๆ (เผื่อ dashboard ส่งซ้ำ)
+      if (millis() - otaRequestMs_ > 200) {
+        otaRequested_ = false;
+
+        Serial.println("[OTA] start from main loop");
+        bool okOta = otaFromHttps_(OTA_URL);
+        if (!okOta) {
+          st_.reason = "OTA failed";
+          Serial.println("[OTA] FAILED (main loop)");
+        }
+      }
+    }
+// ------------------------------------------------------------------------
+
     // HTTP attributes updates (dashboard/API control)
     // httpCmd_.poll(st_, relayLight_, relayValve_);
 
     if (timeSvc_.consumeMinuteTick()) {
       Serial.println("[SQW] Minute Tick");
+    }
+    if (otaInProgress_) {
+      return;
     }
 
     if (millis() - lastCalcUpdate_ >= CONTROL_INTERVAL) {
@@ -1803,6 +1837,11 @@ private:
   unsigned long lastCalcUpdate_ = 0;
   unsigned long lastDebug_ = 0;
   int lastResetDayKey_ = -1;
+  volatile bool otaInProgress_ = false;
+
+  // --- OTA request flag (do NOT run OTA inside MQTT callback) ---
+  volatile bool otaRequested_ = false;
+  unsigned long otaRequestMs_ = 0;
 
   static bool jsonGet01(const char* json, const char* key, int &out01) {
     char pat[48];
@@ -1818,6 +1857,95 @@ private:
     if (*p == '0') { out01 = 0; return true; }
     if (*p == '1') { out01 = 1; return true; }
     return false;
+  }
+  static bool jsonGetInt(const char* json, const char* key, int &out) {
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(json, pat);
+    if (!p) return false;
+
+    p = strchr(p, ':');
+    if (!p) return false;
+    p++;
+    while (*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+
+    bool neg = false;
+    if (*p=='-') { neg=true; p++; }
+    if (*p<'0' || *p>'9') return false;
+
+    long v = 0;
+    while (*p>='0' && *p<='9') { v = v*10 + (*p - '0'); p++; }
+    out = neg ? -(int)v : (int)v;
+    return true;
+  }
+  bool otaFromHttps_(const char* url) {
+    if (!url || !url[0]) return false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+    if (otaInProgress_) return false;
+    otaInProgress_ = true;
+
+    // ลดโหลดระหว่าง OTA กัน brownout
+    relayLight_.write(false);
+    relayValve_.write(false);
+    st_.lightOn = false;
+    st_.valveOn = false;
+    st_.reason = "OTA updating...";
+    ui_.update(st_, 12, 0); // แค่รีเฟรชครั้งหนึ่ง (ไม่ยุ่งระบบอื่น)
+
+    WiFiClientSecure client;
+    if (OTA_TLS_INSECURE) client.setInsecure();
+
+    HTTPClient https;
+    if (!https.begin(client, url)) {
+      Serial.println("[OTA] https.begin fail");
+      otaInProgress_ = false;
+      return false;
+    }
+
+    int code = https.GET();
+    if (code != HTTP_CODE_OK) {
+      Serial.printf("[OTA] GET fail code=%d\n", code);
+      https.end();
+      otaInProgress_ = false;
+      return false;
+    }
+
+    int len = https.getSize();
+    WiFiClient* stream = https.getStreamPtr();
+
+    if (!Update.begin(len > 0 ? (size_t)len : UPDATE_SIZE_UNKNOWN)) {
+      Serial.println("[OTA] Update.begin fail");
+      https.end();
+      otaInProgress_ = false;
+      return false;
+    }
+
+    size_t written = Update.writeStream(*stream);
+    bool okEnd = Update.end();
+
+    https.end();
+
+    if (!okEnd) {
+      Serial.printf("[OTA] Update.end fail err=%d\n", (int)Update.getError());
+      otaInProgress_ = false;
+      return false;
+    }
+    if (!Update.isFinished()) {
+      Serial.println("[OTA] not finished");
+      otaInProgress_ = false;
+      return false;
+    }
+    if (written == 0) {
+      Serial.println("[OTA] written=0");
+      otaInProgress_ = false;
+      return false;
+    }
+
+    Serial.println("[OTA] SUCCESS -> reboot");
+    delay(300);
+    ESP.restart();
+    otaInProgress_ = false;
+    return true;
   }
 
   void mqttCallback_(char* topic, byte* payload, unsigned int length) {
@@ -1868,6 +1996,60 @@ private:
         } else {
           Serial.println(" -> ignore valveCmd because VALVE is AUTO");
         }
+      }
+            // ===================== OTA trigger (Fixed URL) =====================
+      // Dashboard ส่ง otaGo=1 เพื่อเริ่มอัปเดต
+      if (jsonGet01(msg, "otaGo", v) && v == 1) {
+        Serial.println("[OTA] otaGo=1 received -> schedule OTA");
+        otaRequested_ = true;
+        otaRequestMs_ = millis();
+        st_.reason = "OTA scheduled";
+      }
+
+      // ===================== Day preset selector =====================
+      // Dashboard ส่ง dayPreset เป็น index 0..N-1 (โหมดเลือกหลายค่า)
+      int presetIdx;
+      if (jsonGetInt(msg, "dayPreset", presetIdx)) {
+        if (presetIdx < 0) presetIdx = 0;
+        if (presetIdx >= DAY_PRESET_COUNT) presetIdx = DAY_PRESET_COUNT - 1;
+
+        int daySet = DAY_PRESETS[presetIdx];
+        Serial.printf("[DAY] dayPreset=%d -> daySet=%d\n", presetIdx, daySet);
+
+        struct tm ti;
+        if (timeSvc_.getLocalTimeSafe(&ti)) {
+          struct tm t0 = ti;
+          t0.tm_hour = 0; t0.tm_min = 0; t0.tm_sec = 0;
+          time_t today00 = mktime(&t0);
+
+          st_.transplantEpoch = today00 - (time_t)daySet * 86400;
+          prefs_.putULong64(KEY_TRANS_EPOCH, (uint64_t)st_.transplantEpoch);
+
+          GrowPhase_t newP = phaseMgr_.phaseFromDay(daySet);
+          phaseMgr_.apply(st_, newP);
+
+          st_.reason = String("Day preset -> ") + daySet;
+        } else {
+          Serial.println("[DAY] ignored: invalid time");
+        }
+      }
+
+      // ===================== Manual reset day (DLI reset) =====================
+      // Dashboard ส่ง resetDay=1 เพื่อ reset DLI + flags ทันที
+      if (jsonGet01(msg, "resetDay", v) && v == 1) {
+        dli_.resetDaily(st_);
+        prefs_.putBool(KEY_MDONE, false);
+        prefs_.putBool(KEY_EDONE, false);
+
+        // กัน reset ซ้ำทันที: เซฟ KEY_DAY เป็นวันนี้
+        struct tm ti;
+        if (timeSvc_.getLocalTimeSafe(&ti)) {
+          lastResetDayKey_ = ti.tm_yday;
+          prefs_.putInt(KEY_DAY, lastResetDayKey_);
+        }
+
+        st_.reason = "Manual resetDay";
+        Serial.println("[DAY] resetDay=1 -> DLI cleared");
       }
       return;
     }
