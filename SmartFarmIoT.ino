@@ -1902,13 +1902,41 @@ private:
       return false;
     }
 
+    const char* hdrKeys[] = {"Location"};
+    https.collectHeaders(hdrKeys, 1);
     int code = https.GET();
+
+// follow redirect (GitHub / Pages / Releases)
+    for (int i = 0; i < 5 && (code == 301 || code == 302 || code == 307 || code == 308); i++) {
+      String loc = https.header("Location");
+      https.end();
+
+      if (loc.length() == 0) {
+        Serial.println("[OTA] redirect without Location");
+        otaInProgress_ = false;
+        return false;
+      }
+
+      Serial.printf("[OTA] redirect -> %s\n", loc.c_str());
+
+      if (!https.begin(client, loc)) {
+        Serial.println("[OTA] https.begin redirect fail");
+        otaInProgress_ = false;
+        return false;
+      }
+      https.collectHeaders(hdrKeys, 1);
+      code = https.GET();
+    }
+
     if (code != HTTP_CODE_OK) {
       Serial.printf("[OTA] GET fail code=%d\n", code);
       https.end();
       otaInProgress_ = false;
       return false;
     }
+    Serial.printf("[OTA] HTTP=%d size=%d\n", code, https.getSize());
+    Serial.printf("[OTA] Content-Type=%s\n", https.header("Content-Type").c_str());
+    Serial.printf("[OTA] Content-Encoding=%s\n", https.header("Content-Encoding").c_str());
 
     int len = https.getSize();
     WiFiClient* stream = https.getStreamPtr();
