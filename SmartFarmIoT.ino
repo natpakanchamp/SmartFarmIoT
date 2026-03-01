@@ -1842,6 +1842,7 @@ private:
   // --- OTA request flag (do NOT run OTA inside MQTT callback) ---
   volatile bool otaRequested_ = false;
   unsigned long otaRequestMs_ = 0;
+  int lastOtaGo_ = 0; 
 
   static bool jsonGet01(const char* json, const char* key, int &out01) {
     char pat[48];
@@ -2027,11 +2028,14 @@ private:
       }
             // ===================== OTA trigger (Fixed URL) =====================
       // Dashboard ส่ง otaGo=1 เพื่อเริ่มอัปเดต
-      if (jsonGet01(msg, "otaGo", v) && v == 1) {
-        Serial.println("[OTA] otaGo=1 received -> schedule OTA");
-        otaRequested_ = true;
-        otaRequestMs_ = millis();
-        st_.reason = "OTA scheduled";
+      if (jsonGet01(msg, "otaGo", v)) {
+        if (v == 1 && lastOtaGo_ == 0) {
+          Serial.println("[OTA] otaGo rising edge -> schedule OTA");
+          otaRequested_ = true;
+          otaRequestMs_ = millis();
+          st_.reason = "OTA scheduled";
+        }
+        lastOtaGo_ = v;
       }
 
       // ===================== Day preset selector =====================
