@@ -39,6 +39,9 @@
 #define SQW_PIN 27
 #define SDA 21
 #define SCL 22
+#define LED_R 14
+#define LED_G 13
+#define LED_B 12
 
 // --------------------- ISR -----------------------------
 DRAM_ATTR volatile bool g_rtcAlarmTriggered = false;
@@ -51,7 +54,7 @@ void IRAM_ATTR onRTCAlarm() {
 static const char* TZ_INFO = "<+07>-7";  // Thailand UTC+7
 
 // --------------------- ESP-NOW fixed channel (must match WiFi channel) ---------------------
-const uint8_t ESPNOW_CHANNEL = 6;
+const uint8_t ESPNOW_CHANNEL = 8;
 #define SOIL_COUNT 4
 
 // IMPORTANT: allow only Node A MAC
@@ -101,6 +104,7 @@ unsigned long lastMqttAttemptMs = 0;
 const unsigned long MQTT_RETRY_MS = 3000UL;
 
 // EMQX TCP (PubSubClient รองรับ)
+
 const char* mqtt_broker = "caboose.proxy.rlwy.net";
 const int   mqtt_port   = 25668;
 const char* mqtt_user = "vBDE9tTsuz09nMWWJZkA";   // EMQX public ใช้ anonymous ได้
@@ -246,6 +250,65 @@ struct SystemState {
   int pulseCycle = 0;
 };
 
+// ===================== RGB STATUS SERVICE =====================
+class RgbStatusService {
+public:
+  RgbStatusService(int r, int g, int b)
+  : rPin_(r), gPin_(g), bPin_(b) {}
+
+  void begin() {
+    // ใช้ 10-bit PWM (0-1023)
+    ledcAttach(rPin_, 5000, 10);
+    ledcAttach(gPin_, 5000, 10);
+    ledcAttach(bPin_, 5000, 10);
+    off();
+  }
+
+  void setColor(uint16_t r, uint16_t g, uint16_t b) {
+    ledcWrite(rPin_, r);
+    ledcWrite(gPin_, g);
+    ledcWrite(bPin_, b);
+  }
+
+  void off() {
+    setColor(0, 0, 0);
+  }
+
+  void update(bool wifiOk, bool mqttOk) {
+
+    // 🔴 WiFi หลุด = แดงค้าง
+    if (!wifiOk) {
+      setColor(1023, 0, 0);
+      return;
+    }
+
+    // 🔴 MQTT ยังไม่ต่อ = กระพริบแดง
+    if (!mqttOk) {
+      static unsigned long lastBlink = 0;
+      static bool state = false;
+
+      if (millis() - lastBlink > 300) {
+        lastBlink = millis();
+        state = !state;
+      }
+
+      if (state)
+        setColor(1023, 0, 0);
+      else
+        off();
+
+      return;
+    }
+
+    // 🟢 ทุกอย่างโอเค = เขียวค้าง
+    setColor(0, 1023, 0);
+  }
+
+private:
+  int rPin_;
+  int gPin_;
+  int bPin_;
+};
 // ============================================================
 // ===================== Relay + ValveGuard ===================
 // ============================================================
@@ -1523,7 +1586,8 @@ public:
     timeSvc_(rtc_),
     netSvc_(wifiMulti_, mqtt_),
     tele_(mqtt_),
-    ui_(tft_, sprite_) {}
+    ui_(tft_, sprite_),
+    rgb_(LED_R, LED_G, LED_B) {}//เพิ่ม
 
   void begin() {
     Serial.begin(115200);
@@ -1537,6 +1601,7 @@ public:
     Wire.begin(SDA, SCL);
 
     ui_.begin();
+    rgb_.begin();//เพิ่ม
 
     prefs_.begin("smartfarm", false);
     st_.dliToday = prefs_.getFloat(KEY_DLI, 0.0f);
@@ -1690,6 +1755,11 @@ public:
       ui_.update(st_, h, m);
     }
 
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);//เพิ่ม
+    bool mqttOk = mqtt_.connected();//เพิ่ม
+
+    rgb_.update(wifiOk, mqttOk);//เพิ่ม
+
     tele_.publishIfDue(st_);
   }
 
@@ -1702,6 +1772,7 @@ private:
   TFT_eSPI tft_;
   TFT_eSprite sprite_{&tft_};
 
+  RgbStatusService rgb_;
   WiFiMulti wifiMulti_;
   WiFiClient espClient_;
   PubSubClient mqtt_;

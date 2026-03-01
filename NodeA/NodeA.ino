@@ -62,8 +62,8 @@ struct __attribute__((packed)) AckPacket {
 const int SOIL_PINS[SOIL_COUNT] = {34, 35, 32, 33};
 
 // Soil calibration
-const int AIR_VALUE   = 655;
-const int WATER_VALUE = 2151;
+const int AIR_VALUE   = 2504;
+const int WATER_VALUE = 501;
 
 const uint8_t ESPNOW_CHANNEL = 8;
 
@@ -89,8 +89,12 @@ static int median5(int a, int b, int c, int d, int e) {
   return arr[2];
 }
 
+static const float SOIL_GAIN = 1.15f;
+static const int SOIL_OFFSET = 10;
+
 static int rawToPercent(int raw) {
   int p = map(raw, AIR_VALUE, WATER_VALUE, 0, 100);
+  p = (int)roundf(p * SOIL_GAIN) + SOIL_OFFSET;
   if (p < 0) p = 0;
   if (p > 100) p = 100;
   return p;
