@@ -1692,6 +1692,7 @@ public:
       // กันยิงซ้ำถี่ๆ (เผื่อ dashboard ส่งซ้ำ)
       if (millis() - otaRequestMs_ > 200) {
         otaRequested_ = false;
+        lastOtaGo_ = 0;
 
         Serial.println("[OTA] start from main loop");
         bool okOta = otaFromHttps_(OTA_URL);
