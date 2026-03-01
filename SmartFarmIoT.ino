@@ -104,7 +104,7 @@ const char* TB_TOKEN = "vBDE9tTsuz09nMWWJZkA";  // token
 // --------------------- OTA (Fixed URL, triggered by dashboard) ---------------------
 // NOTE: ใช้ URL คงที่ ไม่ต้องกรอก URL บน dashboard
 // แนะนำให้เป็น HTTPS direct link ไปที่ไฟล์ .bin
-const char* OTA_URL = "https://github.com/natpakanchamp/SmartFarmIoT/releases/download/ota/nodeb.bin";
+const char* OTA_URL = "https://github.com/natpakanchamp/SmartFarmIoT/releases/download/OTANodeB/nodeb.bin";
 
 // ถ้าอยากง่ายสุดให้ใช้ setInsecure() (ไม่ตรวจ cert) แต่ความปลอดภัยลดลง
 const bool OTA_TLS_INSECURE = true;
