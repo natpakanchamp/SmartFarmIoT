@@ -54,7 +54,7 @@ void IRAM_ATTR onRTCAlarm() {
 static const char* TZ_INFO = "<+07>-7";  // Thailand UTC+7
 
 // --------------------- ESP-NOW fixed channel (must match WiFi channel) ---------------------
-const uint8_t ESPNOW_CHANNEL = 6;
+const uint8_t ESPNOW_CHANNEL = 8;
 #define SOIL_COUNT 4
 
 // IMPORTANT: allow only Node A MAC
@@ -138,6 +138,10 @@ const char* KEY_TRANS_EPOCH = "trEpoch";
 const char* KEY_KWET_P1 = "kWetP1";
 const char* KEY_KWET_P2 = "kWetP2";
 const char* KEY_KWET_P3 = "kWetP3";
+
+// ---- Force light OFF window (local time) ----
+const uint16_t LIGHT_FORCE_OFF_START_MIN = 6 * 60;   // 06:00
+const uint16_t LIGHT_FORCE_OFF_END_MIN   = 18 * 60;  // 18:00
 
 // ============================================================
 // ===================== Protocol (NO ACK/PING) ================
@@ -644,7 +648,7 @@ public:
     if (dt > 5.0f) dt = 5.0f;
 
     if (luxValid || st.lightOn) {
-      float factor = st.lightOn ? LIGHT_FACTOR : SUN_FACTOR;
+      float factor = (lux > 100.0f) ? SUN_FACTOR : LIGHT_FACTOR;
       float ppfd = lux * factor;
       st.dliToday += (ppfd * dt) / 1000000.0f;
     }
@@ -682,6 +686,15 @@ public:
   void update(SystemState &st, int nowMin, float lux) {
     if (st.lightManual) {
       st.lightOn = relay_.isOn();
+      return;
+    }
+
+    if (nowMin >= LIGHT_FORCE_OFF_START_MIN && nowMin < LIGHT_FORCE_OFF_END_MIN) {
+      latch_ = false;
+      if (st.lightOn) {
+        relay_.write(false);
+        st.lightOn = false;
+      }
       return;
     }
 
@@ -1185,7 +1198,7 @@ public:
         mqtt_.publish(topic_status, "SYSTEM RECOVERED", true);
 
         mqtt_.publish("v1/devices/me/attributes/request/1",
-          "{\"sharedKeys\":\"lightMode,lightCmd,valveMode,valveCmd\"}");
+          "{\"sharedKeys\":\"lightMode,lightCmd,valveMode,valveCmd,dayMode,setDay,resetDay\"}");
       } else {
         Serial.print("[MQTT] failed, state="); Serial.println(mqtt_.state());
         Serial.print("[NET] IP="); Serial.println(WiFi.localIP());
@@ -1614,8 +1627,6 @@ public:
     st_.lightOn = relayLight_.isOn();
     st_.valveOn = relayValve_.isOn();
 
-    localLux_.begin();
-
     netSvc_.begin();
     mqtt_.setCallback(App::mqttCallbackStatic);
     instance_ = this;
@@ -1690,6 +1701,16 @@ public:
         h = timeinfo.tm_hour;
         m = timeinfo.tm_min;
         st_.timeSynced = true;
+        if (pendingSetDay_ >= 0) {
+          Serial.printf("[DaySet] applying queued setDay=%d\n", pendingSetDay_);
+          applySetDay_(pendingSetDay_);
+          pendingSetDay_ = -1;
+        }
+        if (pendingResetDay_ == 1) {
+          Serial.println("[DayReset] applying queued resetDay");
+          applyResetDay_();
+          pendingResetDay_ = 0;
+        }
 
         handleDailyReset_(timeinfo);
 
@@ -1725,7 +1746,7 @@ public:
         if (!enough) st_.soilPercent = 100;
 
         if (st_.remoteLuxHealthy) st_.lux = rLux;
-        else st_.lux = localLux_.readLuxSafe();
+        else st_.lux = NAN; 
 
         bool luxValid = !isnan(st_.lux) && !isinf(st_.lux) && st_.lux >= LUX_MIN_VALID && st_.lux <= LUX_MAX_VALID;
 
@@ -1803,6 +1824,9 @@ private:
   unsigned long lastCalcUpdate_ = 0;
   unsigned long lastDebug_ = 0;
   int lastResetDayKey_ = -1;
+  int pendingSetDay_ = -1;
+  int pendingResetDay_ = 0;
+  bool dayManual_ = false;
 
   static bool jsonGet01(const char* json, const char* key, int &out01) {
     char pat[48];
@@ -1820,87 +1844,209 @@ private:
     return false;
   }
 
-  void mqttCallback_(char* topic, byte* payload, unsigned int length) {
-    static char msg[256];
-    unsigned int n = (length < sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
-    memcpy(msg, payload, n);
-    msg[n] = '\0';
+  static bool jsonGetInt(const char* json, const char* key, int &outVal) {
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(json, pat);
+    if (!p) return false;
 
-    while (n > 0 && (msg[n - 1] == ' ' || msg[n - 1] == '\n' || msg[n - 1] == '\r' || msg[n - 1] == '\t')) {
-      msg[n - 1] = '\0';
-      n--;
+    p = strchr(p, ':');
+    if (!p) return false;
+    p++;
+    while (*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+
+    // รองรับค่าติดลบด้วย
+    bool neg = false;
+    if (*p == '-') { neg = true; p++; }
+
+    if (*p < '0' || *p > '9') return false;
+
+    long v = 0;
+    while (*p >= '0' && *p <= '9') {
+      v = v * 10 + (*p - '0');
+      p++;
+      if (v > 1000000) break; // กันค่าหลุด
     }
+    outVal = neg ? -(int)v : (int)v;
+    return true;
+  }
 
-    Serial.printf("Message [%s] %s\n", topic, msg);
+  void applySetDay_(int wantDay) {
+    if (wantDay < 0) wantDay = 0;
+    if (wantDay > 3650) wantDay = 3650; // กันหลุด
 
-    if (strcmp(topic, "v1/devices/me/attributes") == 0 ||
-        strncmp(topic, "v1/devices/me/attributes/response/", 31) == 0) {
-
-      int v;
-
-      if (jsonGet01(msg, "lightMode", v)) {
-        st_.lightManual = (v == 1);
-        Serial.printf("[ATTR] lightMode=%d -> %s\n", v, st_.lightManual ? "MANUAL" : "AUTO");
-      }
-
-      if (jsonGet01(msg, "lightCmd", v)) {
-        Serial.printf("[ATTR] lightCmd=%d\n", v);
-        if (st_.lightManual) {
-          relayLight_.write(v == 1);
-          st_.lightOn = (v == 1);
-          Serial.printf(" -> LIGHT %s\n", v ? "ON" : "OFF");
-        } else {
-          Serial.println(" -> ignore lightCmd because LIGHT is AUTO");
-        }
-      }
-
-      if (jsonGet01(msg, "valveMode", v)) {
-        st_.valveManual = (v == 1);
-        Serial.printf("[ATTR] valveMode=%d -> %s\n", v, st_.valveManual ? "MANUAL" : "AUTO");
-      }
-
-      if (jsonGet01(msg, "valveCmd", v)) {
-        Serial.printf("[ATTR] valveCmd=%d\n", v);
-        if (st_.valveManual) {
-          relayValve_.write(v == 1);
-          st_.valveOn = (v == 1);
-          Serial.printf(" -> VALVE %s\n", v ? "ON" : "OFF");
-        } else {
-          Serial.println(" -> ignore valveCmd because VALVE is AUTO");
-        }
-      }
+    struct tm ti;
+    if (!timeSvc_.getLocalTimeSafe(&ti)) {
+      Serial.println("[DaySet] FAIL: time not synced");
       return;
     }
 
-    // ===================== MQTT TILE CONTROL (TYPE A: TEXT COMMANDS) =====================
-    // Topic: group8/command
-    // Payload: VALVE_MANUAL / VALVE_AUTO / VALVE_ON / VALVE_OFF / LIGHT_MANUAL / LIGHT_AUTO / LIGHT_ON / LIGHT_OFF
-    if (strcmp(topic, mqtt_topic_cmd) == 0) {
-      if (strcmp(msg, "VALVE_MANUAL") == 0) st_.valveManual = true;
-      else if (strcmp(msg, "VALVE_AUTO") == 0) st_.valveManual = false;
-      else if (strcmp(msg, "VALVE_ON") == 0) {
-        if (st_.valveManual) { relayValve_.write(true); st_.valveOn = true; }
-        else Serial.println("System is in AUTO Mode!!");
-      }
-      else if (strcmp(msg, "VALVE_OFF") == 0) {
-        if (st_.valveManual) { relayValve_.write(false); st_.valveOn = false; }
-        else Serial.println("System is in AUTO Mode!!");
-      }
-      else if (strcmp(msg, "LIGHT_MANUAL") == 0) st_.lightManual = true;
-      else if (strcmp(msg, "LIGHT_AUTO") == 0) st_.lightManual = false;
-      else if (strcmp(msg, "LIGHT_ON") == 0) {
-        if (st_.lightManual) { relayLight_.write(true); st_.lightOn = true; }
-        else Serial.println("System is in AUTO Mode!!");
-      }
-      else if (strcmp(msg, "LIGHT_OFF") == 0) {
-        if (st_.lightManual) { relayLight_.write(false); st_.lightOn = false; }
-        else Serial.println("System is in AUTO Mode!!");
-      }
-      else {
-        Serial.println("Unknown command.");
+    // today 00:00 local
+    struct tm t0 = ti;
+    t0.tm_hour = 0; t0.tm_min = 0; t0.tm_sec = 0;
+    time_t today00 = mktime(&t0);
+
+    st_.transplantEpoch = today00 - (time_t)wantDay * 86400;
+    prefs_.putULong64(KEY_TRANS_EPOCH, (uint64_t)st_.transplantEpoch);
+
+    // อัปเดต phase ทันที
+    int dayNow = phaseMgr_.daysAfterTransplant(ti, st_.transplantEpoch);
+    GrowPhase_t newP = phaseMgr_.phaseFromDay(dayNow);
+    phaseMgr_.apply(st_, newP);
+
+    st_.reason = "Day set to " + String(dayNow);
+    Serial.printf("[DaySet] setDay=%d -> DayNow=%d | Phase=%d\n", wantDay, dayNow, (int)newP);
+
+    // (ไม่บังคับ) ส่งกลับไปให้ Dashboard เห็นว่า set สำเร็จ
+    String payload = String("{\"dayNow\":") + dayNow + ",\"phase\":" + (int)newP + "}";
+    mqtt_.publish("v1/devices/me/telemetry", payload.c_str(), false);
+    mqtt_.publish("v1/devices/me/attributes", "{\"setDay\":-1}", true);
+  }
+  void applyResetDay_() {
+    struct tm ti;
+    if (!timeSvc_.getLocalTimeSafe(&ti)) {
+      Serial.println("[DayReset] FAIL: time not synced");
+      return;
+    }
+
+    // today 00:00 local
+    struct tm t0 = ti;
+    t0.tm_hour = 0; t0.tm_min = 0; t0.tm_sec = 0;
+    time_t today00 = mktime(&t0);
+
+    st_.transplantEpoch = today00;                     // Day = 0
+    prefs_.putULong64(KEY_TRANS_EPOCH, (uint64_t)st_.transplantEpoch);
+
+    phaseMgr_.apply(st_, PHASE_1_ESTABLISH);           // กลับ P1 ทันที
+    dli_.resetDaily(st_);
+    prefs_.putBool(KEY_MDONE, false);
+    prefs_.putBool(KEY_EDONE, false);
+    st_.reason = "Day reset -> 0";
+
+    Serial.println("[DayReset] done (Day=0, Phase=P1)");
+
+    // ส่งกลับให้ Dashboard เห็นผล (optional)
+    mqtt_.publish("v1/devices/me/telemetry", "{\"dayNow\":0,\"phase\":0}", false);
+
+    // เคลียร์ปุ่ม resetDay ใน shared attributes (ทำให้ปุ่มกดครั้งเดียว)
+    mqtt_.publish("v1/devices/me/attributes", "{\"resetDay\":0}", true);
+  }
+
+  void mqttCallback_(char* topic, byte* payload, unsigned int length) {
+  static char msg[1024];
+  unsigned int n = (length < sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
+  memcpy(msg, payload, n);
+  msg[n] = '\0';
+
+  while (n > 0 && (msg[n - 1] == ' ' || msg[n - 1] == '\n' || msg[n - 1] == '\r' || msg[n - 1] == '\t')) {
+    msg[n - 1] = '\0';
+    n--;
+  }
+
+  Serial.printf("Message [%s] %s\n", topic, msg);
+
+  // ===================== ATTRIBUTES =====================
+  if (strcmp(topic, "v1/devices/me/attributes") == 0 ||
+      strncmp(topic, "v1/devices/me/attributes/response/", 31) == 0) {
+
+    int v;
+
+    // light
+    if (jsonGet01(msg, "lightMode", v)) {
+      st_.lightManual = (v == 1);
+      Serial.printf("[ATTR] lightMode=%d -> %s\n", v, st_.lightManual ? "MANUAL" : "AUTO");
+    }
+    if (jsonGet01(msg, "lightCmd", v)) {
+      Serial.printf("[ATTR] lightCmd=%d\n", v);
+      if (st_.lightManual) { relayLight_.write(v == 1); st_.lightOn = (v == 1); }
+      else Serial.println(" -> ignore lightCmd because LIGHT is AUTO");
+    }
+
+    // valve
+    if (jsonGet01(msg, "valveMode", v)) {
+      st_.valveManual = (v == 1);
+      Serial.printf("[ATTR] valveMode=%d -> %s\n", v, st_.valveManual ? "MANUAL" : "AUTO");
+    }
+    if (jsonGet01(msg, "valveCmd", v)) {
+      Serial.printf("[ATTR] valveCmd=%d\n", v);
+      if (st_.valveManual) { relayValve_.write(v == 1); st_.valveOn = (v == 1); }
+      else Serial.println(" -> ignore valveCmd because VALVE is AUTO");
+    }
+
+    // dayMode
+    if (jsonGet01(msg, "dayMode", v)) {
+      dayManual_ = (v == 1);
+      Serial.printf("[ATTR] dayMode=%d -> %s\n", v, dayManual_ ? "MANUAL" : "AUTO");
+    }
+
+    // setDay
+    int daySet;
+    if (jsonGetInt(msg, "setDay", daySet)) {
+      Serial.printf("[ATTR] setDay=%d\n", daySet);
+
+      if (!dayManual_) {
+        Serial.println("[DaySet] ignore because dayMode is AUTO");
+      } else if (daySet < 0) {
+        Serial.println("[DaySet] ignore setDay < 0");
+      } else {
+        struct tm tmp;
+        if (!timeSvc_.getLocalTimeSafe(&tmp)) {
+          pendingSetDay_ = daySet;
+          Serial.println("[DaySet] queued (time not ready yet)");
+        } else {
+          applySetDay_(daySet);
+        }
       }
     }
+
+    // resetDay
+    int rst;
+    if (jsonGet01(msg, "resetDay", rst) && rst == 1) {
+      Serial.println("[ATTR] resetDay=1");
+
+      if (!dayManual_) {
+        Serial.println("[DayReset] ignore because dayMode is AUTO");
+      } else {
+        struct tm tmp;
+        if (!timeSvc_.getLocalTimeSafe(&tmp)) {
+          pendingResetDay_ = 1;
+          Serial.println("[DayReset] queued (time not ready yet)");
+        } else {
+          applyResetDay_();
+        }
+      }
+    }
+
+    return; // จบการ handle attributes
   }
+
+  // ===================== MQTT TILE CONTROL (TEXT COMMANDS) =====================
+  if (strcmp(topic, mqtt_topic_cmd) == 0) {
+    if (strcmp(msg, "VALVE_MANUAL") == 0) st_.valveManual = true;
+    else if (strcmp(msg, "VALVE_AUTO") == 0) st_.valveManual = false;
+    else if (strcmp(msg, "VALVE_ON") == 0) {
+      if (st_.valveManual) { relayValve_.write(true); st_.valveOn = true; }
+      else Serial.println("System is in AUTO Mode!!");
+    }
+    else if (strcmp(msg, "VALVE_OFF") == 0) {
+      if (st_.valveManual) { relayValve_.write(false); st_.valveOn = false; }
+      else Serial.println("System is in AUTO Mode!!");
+    }
+    else if (strcmp(msg, "LIGHT_MANUAL") == 0) st_.lightManual = true;
+    else if (strcmp(msg, "LIGHT_AUTO") == 0) st_.lightManual = false;
+    else if (strcmp(msg, "LIGHT_ON") == 0) {
+      if (st_.lightManual) { relayLight_.write(true); st_.lightOn = true; }
+      else Serial.println("System is in AUTO Mode!!");
+    }
+    else if (strcmp(msg, "LIGHT_OFF") == 0) {
+      if (st_.lightManual) { relayLight_.write(false); st_.lightOn = false; }
+      else Serial.println("System is in AUTO Mode!!");
+    }
+    else {
+      Serial.println("Unknown command.");
+    }
+  }
+}
 
   void handleDailyReset_(const struct tm& timeinfo) {
     int dayKey = timeinfo.tm_yday;

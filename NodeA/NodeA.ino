@@ -322,6 +322,10 @@ public:
     Serial.begin(115200);
     delay(200);
 
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    delay(50);
+
     Serial.print("[WiFi] MAC: ");
     Serial.println(WiFi.macAddress());
 
@@ -382,7 +386,7 @@ private:
     pkt.seq = ++luxSeq_;
     pkt.uptimeMs = millis();
     pkt.sensorOk = ok ? 1 : 0;
-    pkt.lux = ok ? luxVal : NAN;
+    pkt.lux = ok ? luxVal : -1.0f;
 
     esp_err_t r = link_.send(&pkt, sizeof(pkt));
     if (r != ESP_OK) {
